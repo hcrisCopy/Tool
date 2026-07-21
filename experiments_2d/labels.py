@@ -216,5 +216,7 @@ def generate_no_tool_labels(
     finally:
         del agent
         gc.collect()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
