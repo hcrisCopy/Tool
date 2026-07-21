@@ -1,0 +1,32 @@
+{
+  "A": {
+    "name": "computational-scale",
+    "environments": [
+      "CalculatorEnv",
+      "StatisticsEnv",
+      "CountingEnv",
+      "MatrixEnv",
+      "PrimeEnv"
+    ]
+  },
+  "B": {
+    "name": "knowledge-boundary",
+    "environments": [
+      "RetrieverEnv",
+      "HistoricalYearEnv",
+      "GameRuleEnv",
+      "HashEnv",
+      "DecodingEnv"
+    ]
+  },
+  "C": {
+    "name": "reliable-execution",
+    "environments": [
+      "ListManipulationEnv",
+      "DateTimeEnv",
+      "CodeExecutorEnv",
+      "ScheduleEnv",
+      "RegexMatchEnv"
+    ]
+  }
+}

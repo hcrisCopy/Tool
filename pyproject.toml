@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calltool-2d"
+version = "0.1.0"
+description = "Layer-onset and hidden-state-neuron analysis for two-dimensional tool decisions"
+requires-python = ">=3.11,<3.12"
+
+[tool.setuptools.packages.find]
+include = ["experiments_2d*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

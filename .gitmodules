@@ -1,0 +1,3 @@
+[submodule "third_party/when2tool"]
+	path = third_party/when2tool
+	url = https://github.com/Trustworthy-ML-Lab/when2tool.git
