@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("smoke", "full"), default="full")
     parser.add_argument("--n-shuffles", type=int, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--label-seed",
+        type=int,
+        default=None,
+        help="Generation seed for hard-no-tool labels (default: first configured seed).",
+    )
     return parser.parse_args()
 
 
@@ -49,6 +55,11 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA onset analysis requested but CUDA is unavailable")
     config = load_config(args.config)
+    label_seed = config.generation.seeds[0] if args.label_seed is None else args.label_seed
+    if label_seed not in config.generation.seeds:
+        raise ValueError(
+            f"--label-seed {label_seed} is not one of {config.generation.seeds}"
+        )
     n_shuffles = (
         config.analysis.n_label_shuffles_primary
         if args.n_shuffles is None
@@ -63,7 +74,7 @@ def main() -> None:
         config.run_root
         / "labels"
         / args.mode
-        / f"seed_{config.generation.seeds[0]}"
+        / f"seed_{label_seed}"
         / "train_no_tool_outputs.json"
     )
     necessity_metadata = _load_json(
@@ -79,6 +90,17 @@ def main() -> None:
 
     hidden_necessity = torch.load(necessity_path, map_location="cpu", weights_only=True)
     hidden_type = torch.load(type_path, map_location="cpu", weights_only=True)
+    expected_shape = (
+        len(labels),
+        config.model.num_hidden_layers + 1,
+        config.model.hidden_size,
+    )
+    if tuple(hidden_necessity.shape) != expected_shape:
+        raise ValueError(
+            f"P_no_schema hidden shape {tuple(hidden_necessity.shape)} != {expected_shape}"
+        )
+    if tuple(hidden_type.shape) != expected_shape:
+        raise ValueError(f"P_all hidden shape {tuple(hidden_type.shape)} != {expected_shape}")
     result, scalers = run_onset_analysis(
         hidden_necessity,
         hidden_type,
@@ -89,7 +111,14 @@ def main() -> None:
         max_window=config.analysis.max_onset_window,
         device=args.device,
     )
-    output_dir = config.run_root / "onset" / args.mode / f"shuffles_{n_shuffles}"
+    output_dir = (
+        config.run_root
+        / "onset"
+        / args.mode
+        / f"label_seed_{label_seed}"
+        / f"shuffles_{n_shuffles}"
+    )
+    result["label_seed"] = label_seed
     atomic_write_json(output_dir / "onset_summary.json", result)
     atomic_write_csv(
         output_dir / "onset_curves.csv",

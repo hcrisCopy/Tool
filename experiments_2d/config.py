@@ -51,6 +51,8 @@ class GenerationSpec:
     temperature: float
     top_p: float
     top_k: int
+    repetition_penalty: float
+    do_sample: bool
     max_new_tokens: int
     max_rounds: int
     max_model_len: int
@@ -143,11 +145,18 @@ def load_config(path: str | Path) -> ExperimentConfig:
     seeds = tuple(int(seed) for seed in _require(raw_generation, "seeds", "generation"))
     if len(seeds) != len(set(seeds)) or not seeds:
         raise ValueError("generation.seeds must be a non-empty list of unique integers")
+    do_sample = _require(raw_generation, "do_sample", "generation")
+    if not isinstance(do_sample, bool):
+        raise TypeError("generation.do_sample must be a boolean")
     generation = GenerationSpec(
         seeds=seeds,
         temperature=float(_require(raw_generation, "temperature", "generation")),
         top_p=float(_require(raw_generation, "top_p", "generation")),
         top_k=int(_require(raw_generation, "top_k", "generation")),
+        repetition_penalty=float(
+            _require(raw_generation, "repetition_penalty", "generation")
+        ),
+        do_sample=do_sample,
         max_new_tokens=int(
             _require(raw_generation, "max_new_tokens", "generation")
         ),

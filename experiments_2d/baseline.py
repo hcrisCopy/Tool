@@ -12,6 +12,7 @@ import torch
 from safetensors import safe_open
 
 from .config import ExperimentConfig
+from .constants import EXPECTED_SPLIT_SIZES
 from .io_utils import atomic_torch_save, atomic_write_json, sha256_file
 from .upstream import EXPECTED_COMMIT, verify_upstream_checkout
 
@@ -111,8 +112,33 @@ def materialize_w2t_inputs(config: ExperimentConfig) -> Path:
             )
         raw_hidden = torch.load(hidden_path, map_location="cpu", weights_only=True)
         rows = json.loads(labels_path.read_text(encoding="utf-8"))
-        if raw_hidden.shape[0] != len(rows):
-            raise ValueError(f"{split}: hidden/label row count mismatch")
+        metadata_path = (
+            config.run_root / "hidden" / "full" / "P_env" / f"{split}_metadata.json"
+        )
+        if not metadata_path.is_file():
+            raise FileNotFoundError(metadata_path)
+        hidden_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        expected_shape = (
+            EXPECTED_SPLIT_SIZES[split],
+            config.model.num_hidden_layers + 1,
+            config.model.hidden_size,
+        )
+        if tuple(raw_hidden.shape) != expected_shape:
+            raise ValueError(
+                f"{split}: hidden shape {tuple(raw_hidden.shape)} != {expected_shape}"
+            )
+        if len(rows) != EXPECTED_SPLIT_SIZES[split]:
+            raise ValueError(
+                f"{split}: label count {len(rows)} != {EXPECTED_SPLIT_SIZES[split]}"
+            )
+        hidden_ids = [row["id"] for row in hidden_metadata]
+        label_ids = [row["id"] for row in rows]
+        if hidden_ids != label_ids:
+            raise ValueError(f"{split}: hidden metadata and label ID order differ")
+        if any(row.get("upstream_commit") != EXPECTED_COMMIT for row in rows):
+            raise ValueError(f"{split}: labels are not from the pinned upstream evaluator")
+        if any(row.get("seed") != config.generation.seeds[0] for row in rows):
+            raise ValueError(f"{split}: labels do not use the primary generation seed")
         public_hidden = apply_public_final_norm(raw_hidden, weight, epsilon)
         baseline_hidden_path = output_dir / f"{split}_hidden_no_reasoning.pt"
         baseline_label_path = output_dir / f"{split}_labels_no_reasoning.json"
@@ -120,6 +146,8 @@ def materialize_w2t_inputs(config: ExperimentConfig) -> Path:
         atomic_write_json(baseline_label_path, _baseline_labels(rows, split))
         input_manifest["splits"][split] = {
             "shape": list(public_hidden.shape),
+            "first_id": label_ids[0],
+            "last_id": label_ids[-1],
             "hidden_sha256": sha256_file(baseline_hidden_path),
             "labels_sha256": sha256_file(baseline_label_path),
         }
@@ -144,9 +172,40 @@ def run_pinned_w2t_all_probe(config: ExperimentConfig) -> Path:
         "10000",
         "--all_layers",
     ]
-    subprocess.run(command, check=True, cwd=upstream_root)
     result_path = output_dir / "probe_results_no_reasoning.json"
-    if not result_path.is_file():
+    probe_path = output_dir / "probe_no_reasoning.pt"
+    if result_path.exists() or probe_path.exists():
+        raise FileExistsError(
+            "Pinned baseline outputs already exist; archive the old run before rerunning"
+        )
+    subprocess.run(command, check=True, cwd=upstream_root)
+    if not result_path.is_file() or not probe_path.is_file():
         raise FileNotFoundError("Pinned baseline script did not create its result JSON")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    expected_result = {
+        "mode": "no_reasoning",
+        "C": 0.0001,
+        "all_layers": True,
+        "n_layers": config.model.num_hidden_layers + 1,
+        "hidden_dim": config.model.hidden_size,
+        "best_layer": "all",
+    }
+    for key, expected_value in expected_result.items():
+        if result.get(key) != expected_value:
+            raise ValueError(
+                f"Pinned baseline result {key}={result.get(key)!r} != {expected_value!r}"
+            )
+    for metric in ("best_test_auroc", "best_test_acc"):
+        value = result.get(metric)
+        if not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"Pinned baseline returned invalid {metric}={value!r}")
+    probe = torch.load(probe_path, map_location="cpu", weights_only=True)
+    if probe.get("layer") != "all" or probe.get("n_layers") != expected_result["n_layers"]:
+        raise ValueError("Pinned baseline probe metadata is inconsistent")
+    expected_features = expected_result["n_layers"] * expected_result["hidden_dim"]
+    if tuple(probe["coef"].shape) != (expected_features,):
+        raise ValueError(
+            f"Pinned baseline coefficient shape {tuple(probe['coef'].shape)} "
+            f"!= {(expected_features,)}"
+        )
     return result_path
-

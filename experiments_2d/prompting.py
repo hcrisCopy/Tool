@@ -5,8 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .constants import CATEGORY_NAMES
-from .upstream import build_environment_tools
+from .upstream import build_all_candidate_tools, build_environment_tools
 
 
 SYSTEM_PROMPT = (
@@ -39,34 +38,9 @@ def no_tool_user_message(instruction: str) -> str:
 
 
 def all_type_tools() -> list[dict[str, Any]]:
-    """Return a fixed three-tool P_all menu shared by every sample."""
+    """Return the fixed all-candidate P_all menu shared by every sample."""
 
-    tools: list[dict[str, Any]] = []
-    for category in ("A", "B", "C"):
-        semantic_name = CATEGORY_NAMES[category]
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": f"type_{category.lower()}_{semantic_name.replace('-', '_')}",
-                    "description": (
-                        f"Route a type-{category} ({semantic_name}) task to the "
-                        "appropriate concrete environment operation."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "environment": {"type": "string"},
-                            "operation": {"type": "string"},
-                            "arguments": {"type": "object"},
-                        },
-                        "required": ["environment", "operation", "arguments"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        )
-    return tools
+    return deepcopy(list(build_all_candidate_tools()))
 
 
 def tools_for_variant(task: dict[str, Any], variant: str) -> list[dict[str, Any]]:
@@ -101,7 +75,7 @@ def render_prompt(
     }
     if tools:
         kwargs["tools"] = tools
-    rendered = tokenizer.apply_chat_template(messages, **kwargs)
+    rendered = tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
     if not isinstance(rendered, str) or not rendered:
         raise ValueError("Tokenizer returned an empty chat-template rendering")
     return rendered
@@ -118,7 +92,9 @@ def render_prompt_ids(
     }
     if tools:
         kwargs["tools"] = tools
-    token_ids = tokenizer.apply_chat_template(messages, **kwargs)
+    token_ids = tokenizer.apply_chat_template(
+        messages, enable_thinking=False, **kwargs
+    )
     if not isinstance(token_ids, list) or not token_ids:
         raise TypeError("Tokenizer did not return a non-empty token-id list")
     if not all(isinstance(token_id, int) for token_id in token_ids):

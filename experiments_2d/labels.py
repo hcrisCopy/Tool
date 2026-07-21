@@ -1,194 +1,212 @@
-"""Reproducible no-tool generation and model-specific necessity labels."""
+"""Pinned When2Tool hard-no-tool labels with execution disabled by construction."""
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
-from dataclasses import dataclass, field
+import random
 from typing import Any
 
-from tqdm import tqdm
+import numpy as np
+import torch
 
 from .config import ExperimentConfig
 from .constants import ENV_TO_CATEGORY
-from .prompting import initial_messages, render_prompt, tools_for_variant
-from .scoring import (
-    extract_boxed,
-    has_nontrivial_reasoning_before_box,
-    has_tool_call,
-    score_final_response,
-)
+from .upstream import EXPECTED_COMMIT, load_upstream_runtime
 
 
-NO_TOOL_REJECTION = (
-    "Tool use is not available. Solve the problem directly without tools and "
-    "provide your final answer in \\boxed{...}."
-)
-REASONING_REJECTION = (
-    "Final answer rejected: reasoning is not allowed in no_reasoning mode. "
-    "Retry with final answer in \\boxed{...} only."
-)
-CONTINUE_NO_REASONING = (
-    "Continue. You must do exactly one of these next (no reasoning text):\n"
-    "1) Provide one valid tool call.\n"
-    "2) Provide final answer in \\boxed{...}."
-)
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-@dataclass
-class NoToolState:
-    task: dict[str, Any]
-    messages: list[dict[str, str]]
-    tools: list[dict[str, Any]]
-    prompt_hash: str = ""
-    rounds: int = 0
-    done: bool = False
-    final_response: str = ""
-    trace: list[dict[str, Any]] = field(default_factory=list)
+def _build_pinned_agent(config: ExperimentConfig, seed: int) -> Any:
+    """Construct the exact upstream AgentModel, adding only an explicit LLM seed.
 
+    Seed 0 is identical to vLLM's upstream default.  Seeds 1 and 2 are repeat
+    runs; no parser, prompt, state-machine, or sampling parameter is changed.
+    """
 
-def _sampling_params(config: ExperimentConfig, seed: int) -> Any:
-    from vllm import SamplingParams
-
-    return SamplingParams(
-        n=1,
-        temperature=config.generation.temperature,
-        top_p=config.generation.top_p,
-        top_k=config.generation.top_k,
-        max_tokens=config.generation.max_new_tokens,
-        seed=seed,
-    )
-
-
-def _load_engine(config: ExperimentConfig, seed: int) -> tuple[Any, Any]:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    from transformers import AutoTokenizer
-    from vllm import LLM
+    _, upstream_model = load_upstream_runtime()
+    import vllm
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.paths.model,
-        local_files_only=True,
-        trust_remote_code=False,
-    )
-    engine = LLM(
-        model=str(config.paths.model),
-        tokenizer=str(config.paths.model),
-        tensor_parallel_size=config.generation.tensor_parallel_size,
-        max_model_len=config.generation.max_model_len,
-        dtype=config.model.torch_dtype,
-        gpu_memory_utilization=config.generation.gpu_memory_utilization,
-        seed=seed,
-        trust_remote_code=False,
-        disable_log_stats=True,
-    )
-    return engine, tokenizer
+    original_llm = vllm.LLM
+
+    def seeded_llm(*args: Any, **kwargs: Any) -> Any:
+        if "seed" in kwargs:
+            raise ValueError("Pinned upstream unexpectedly supplied its own vLLM seed")
+        kwargs["seed"] = seed
+        return original_llm(*args, **kwargs)
+
+    # VLLMAgentBackend imports LLM inside __init__, so this scoped replacement
+    # preserves the pinned implementation and only exposes the repeat seed.
+    vllm.LLM = seeded_llm
+    try:
+        agent = upstream_model.AgentModel(
+            model_path=str(config.paths.model),
+            backend="vllm",
+            max_new_tokens=config.generation.max_new_tokens,
+            tensor_parallel_size=config.generation.tensor_parallel_size,
+            max_model_len=config.generation.max_model_len,
+            vllm_dtype=config.model.torch_dtype,
+            enable_thinking=False,
+        )
+    finally:
+        vllm.LLM = original_llm
+    agent.max_model_len = config.generation.max_model_len
+    generation_config = agent.engine.generation_config
+    expected = {
+        "temperature": config.generation.temperature,
+        "top_p": config.generation.top_p,
+        "top_k": config.generation.top_k,
+        "repetition_penalty": config.generation.repetition_penalty,
+        "do_sample": config.generation.do_sample,
+    }
+    actual = {
+        key: getattr(generation_config, key, None) for key in expected
+    }
+    for key, expected_value in expected.items():
+        actual_value = actual[key]
+        if actual_value is None or float(actual_value) != float(expected_value):
+            raise ValueError(
+                f"Model generation_config.{key}={actual_value} != frozen {expected_value}"
+            )
+    if config.generation.gpu_memory_utilization != 0.90:
+        raise ValueError(
+            "Pinned When2Tool vLLM backend uses its default gpu_memory_utilization=0.90"
+        )
+    return agent
 
 
-def _initial_state(task: dict[str, Any]) -> NoToolState:
-    return NoToolState(
-        task=task,
-        messages=initial_messages(task, no_tool=True),
-        tools=tools_for_variant(task, "P_env"),
-    )
+def _validate_initial_prompts(tasks: list[dict[str, Any]], agent: Any) -> None:
+    """Fail before generation if any official prompt cannot be rendered exactly."""
+
+    upstream_utils, _ = load_upstream_runtime()
+    for task in tasks:
+        state = upstream_utils.init_state(
+            task,
+            agent.system_prompt,
+            record_mode="lite",
+            prompt_mode="hard_no_tool",
+            require_reasoning=False,
+            tool_format="xml",
+            tokenizer=agent.tokenizer,
+        )
+        prompt = agent.render_prompt(state["messages"], state["tools"])
+        token_ids = agent.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if not token_ids:
+            raise ValueError(f"Task {task['id']} rendered an empty hard-no-tool prompt")
+        if len(token_ids) > agent.max_model_len - 128:
+            raise ValueError(
+                f"Task {task['id']} hard-no-tool prompt has {len(token_ids)} tokens; "
+                f"limit is {agent.max_model_len - 128}"
+            )
 
 
-def _advance_state(state: NoToolState, raw_text: str) -> None:
-    state.rounds += 1
-    state.messages.append({"role": "assistant", "content": raw_text})
-    action: str
-    if has_tool_call(raw_text):
-        state.messages.append({"role": "user", "content": NO_TOOL_REJECTION})
-        action = "tool_rejected"
-    elif extract_boxed(raw_text):
-        if has_nontrivial_reasoning_before_box(raw_text):
-            state.messages.append({"role": "user", "content": REASONING_REJECTION})
-            action = "reasoning_rejected"
-        else:
-            state.final_response = raw_text
-            state.done = True
-            action = "accepted_final"
-    else:
-        state.messages.append({"role": "user", "content": CONTINUE_NO_REASONING})
-        action = "continue"
-    state.trace.append(
-        {
-            "round": state.rounds,
-            "raw_text": raw_text,
-            "action": action,
-        }
-    )
+def _normalize_output(
+    task: dict[str, Any], output: dict[str, Any], seed: int
+) -> dict[str, Any]:
+    upstream_utils, _ = load_upstream_runtime()
+    if output.get("id") != task.get("id"):
+        raise ValueError(
+            f"Upstream output id {output.get('id')} != input id {task.get('id')}"
+        )
+    trace = output.get("trace")
+    if not isinstance(trace, list) or not trace:
+        raise ValueError(f"Task {task['id']} has no upstream inference trace")
+    prompt_text = trace[0].get("prompt_text")
+    if not isinstance(prompt_text, str) or not prompt_text:
+        raise ValueError(f"Task {task['id']} has no first-round prompt text")
+    raw, boxed, cleaned, correct = upstream_utils.item_final_eval(output)
+    env_name = task["environments"][0]["name"]
+    if env_name not in ENV_TO_CATEGORY:
+        raise KeyError(f"Task {task['id']} has unmapped environment {env_name}")
+    if int(output.get("tool_calls", -1)) != 0:
+        raise AssertionError(
+            f"hard_no_tool task {task['id']} executed {output.get('tool_calls')} tools"
+        )
+    return {
+        "id": task["id"],
+        "difficulty": task["difficulty"],
+        "env": env_name,
+        "category": ENV_TO_CATEGORY[env_name],
+        "tool_type": ENV_TO_CATEGORY[env_name],
+        "seed": seed,
+        "prompt_variant": "P_env",
+        "prompt_hash": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "rounds": int(output["rounds"]),
+        "completed": bool(output.get("final_response")),
+        "final_response": raw,
+        "boxed_answer": boxed,
+        "cleaned_answer": cleaned,
+        "gold_answer": task["expected"]["answer"],
+        "no_tool_correct": int(correct),
+        "tool_necessary": int(not correct),
+        "tool_calls": 0,
+        "generation_tokens": int(output.get("generation_tokens", 0)),
+        "prefill_tokens": int(output.get("prefill_tokens", 0)),
+        "reasoning_mode": output.get("reasoning_mode"),
+        "upstream_commit": EXPECTED_COMMIT,
+        "enable_thinking": False,
+        "trace": trace,
+    }
 
 
 def generate_no_tool_labels(
     tasks: list[dict[str, Any]], config: ExperimentConfig, seed: int
 ) -> list[dict[str, Any]]:
-    """Run the audited hard-no-tool state machine without executing any tool."""
+    """Run pinned hard-no-tool evaluation while forbidding every tool execution."""
 
     if not tasks:
         raise ValueError("No tasks supplied for no-tool labeling")
     ids = [task["id"] for task in tasks]
     if len(ids) != len(set(ids)):
         raise ValueError("Duplicate task ids in no-tool labeling input")
+    if seed not in config.generation.seeds:
+        raise ValueError(f"Label seed {seed} is not configured: {config.generation.seeds}")
 
-    engine, tokenizer = _load_engine(config, seed)
-    params = _sampling_params(config, seed)
-    states = [_initial_state(task) for task in tasks]
-    progress = tqdm(total=len(states), desc=f"no-tool seed={seed}", unit="task")
+    _seed_everything(seed)
+    upstream_utils, _ = load_upstream_runtime()
+    agent = _build_pinned_agent(config, seed)
+    try:
+        _validate_initial_prompts(tasks, agent)
 
-    for _round in range(1, config.generation.max_rounds + 1):
-        active = [state for state in states if not state.done]
-        if not active:
-            break
-        prompts: list[str] = []
-        for state in active:
-            prompt = render_prompt(tokenizer, state.messages, state.tools)
-            if not state.prompt_hash:
-                state.prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            prompts.append(prompt)
-        generated = engine.generate(prompts, params, use_tqdm=False)
-        if len(generated) != len(active):
-            raise RuntimeError(
-                f"vLLM returned {len(generated)} outputs for {len(active)} prompts"
+        def forbidden_route(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("Tool execution reached during hard_no_tool labeling")
+
+        original_route = upstream_utils.route_tool_call
+        upstream_utils.route_tool_call = forbidden_route
+        try:
+            upstream_outputs = upstream_utils.evaluate_batched(
+                tasks,
+                agent,
+                max_rounds=config.generation.max_rounds,
+                record_mode="lite",
+                prompt_mode="hard_no_tool",
+                require_reasoning=False,
+                tool_format="xml",
             )
-        for state, request_output in zip(active, generated, strict=True):
-            if len(request_output.outputs) != 1:
-                raise RuntimeError(
-                    f"Task {state.task['id']} returned {len(request_output.outputs)} sequences"
-                )
-            was_done = state.done
-            _advance_state(state, request_output.outputs[0].text)
-            if state.done and not was_done:
-                progress.update(1)
-        progress.set_postfix(active=sum(not state.done for state in states))
-    progress.close()
-
-    results: list[dict[str, Any]] = []
-    for state in states:
-        gold = state.task["expected"]["answer"]
-        boxed, correct = score_final_response(state.final_response, gold)
-        env_name = state.task["environments"][0]["name"]
-        results.append(
-            {
-                "id": state.task["id"],
-                "difficulty": state.task["difficulty"],
-                "env": env_name,
-                "category": ENV_TO_CATEGORY[env_name],
-                "tool_type": ENV_TO_CATEGORY[env_name],
-                "seed": seed,
-                "prompt_variant": "P_env",
-                "prompt_hash": state.prompt_hash,
-                "rounds": state.rounds,
-                "completed": state.done,
-                "final_response": state.final_response,
-                "boxed_answer": boxed,
-                "gold_answer": gold,
-                "no_tool_correct": int(correct),
-                "tool_necessary": int(not correct),
-                "trace": state.trace,
-            }
-        )
-    if [result["id"] for result in results] != ids:
-        raise AssertionError("No-tool output order changed")
-    return results
-
+        finally:
+            upstream_utils.route_tool_call = original_route
+        if len(upstream_outputs) != len(tasks):
+            raise RuntimeError(
+                f"Pinned evaluator returned {len(upstream_outputs)} outputs for "
+                f"{len(tasks)} tasks"
+            )
+        results = [
+            _normalize_output(task, output, seed)
+            for task, output in zip(tasks, upstream_outputs, strict=True)
+        ]
+        if [row["id"] for row in results] != ids:
+            raise AssertionError("No-tool output order changed")
+        return results
+    finally:
+        del agent
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

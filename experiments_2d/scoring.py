@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
+import warnings
 from typing import Any
 
 
@@ -28,12 +30,12 @@ def extract_boxed(text: Any) -> str:
         elif character == "}":
             depth -= 1
             if depth == 0:
-                return "".join(output).strip()
+                break
             output.append(character)
         else:
             output.append(character)
         index += 1
-    return ""
+    return "".join(output).strip() if output else source
 
 
 def _normalize_structured(value: Any) -> Any:
@@ -59,7 +61,7 @@ def _parse_structured(text: Any) -> Any | None:
         return None
     try:
         return _normalize_structured(ast.literal_eval(source))
-    except (SyntaxError, ValueError):
+    except Exception:
         return None
 
 
@@ -88,10 +90,32 @@ def score_final_response(raw_text: str, gold: Any) -> tuple[str, bool]:
 
 
 def has_tool_call(text: str) -> bool:
-    source = text or ""
+    source = (text or "").strip().replace("```json", "").replace("```", "").strip()
+
+    def parse(block: str) -> bool:
+        try:
+            data = json.loads(block)
+        except Exception:
+            try:
+                data = json.loads(block.replace("'", '"'))
+            except Exception:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", SyntaxWarning)
+                        data = ast.literal_eval(block)
+                    json.dumps(data)
+                except Exception:
+                    return False
+        return isinstance(data, dict) and "name" in data
+
     if "<tool_call>" in source:
+        body = source.split("<tool_call>", 1)[1]
+        body = body.split("</tool_call>", 1)[0].strip()
+        if parse(body):
+            return True
+    if parse(source):
         return True
-    return bool(re.search(r'\{[\s\S]*?["\']name["\']\s*:', source))
+    return any(parse(match.group(0)) for match in re.finditer(r"\{[\s\S]*?\}", source))
 
 
 def has_nontrivial_reasoning_before_box(text: str) -> bool:
@@ -100,4 +124,3 @@ def has_nontrivial_reasoning_before_box(text: str) -> bool:
     prefix = source[:index] if index >= 0 else source
     prefix = re.sub(r"\s+", " ", prefix).strip()
     return len(prefix) >= 12 and re.search(r"[A-Za-z]", prefix) is not None
-

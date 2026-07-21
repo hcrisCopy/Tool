@@ -9,6 +9,9 @@ def test_config_freezes_single_gpu_qwen_protocol() -> None:
     assert config.model.num_hidden_layers == 36
     assert config.model.hidden_size == 2560
     assert config.generation.tensor_parallel_size == 1
+    assert config.generation.seeds == (0, 1, 2)
+    assert config.generation.repetition_penalty == 1.0
+    assert config.generation.do_sample is True
     assert config.analysis.onset_peak_fraction == 0.95
 
 
@@ -35,12 +38,13 @@ def test_smoke_subset_has_one_task_per_environment_difficulty_cell() -> None:
     assert len(cells) == 45
 
 
-def test_p_all_menu_is_fixed_three_type_tools() -> None:
+def test_p_all_menu_is_fixed_namespaced_all_candidate_tools() -> None:
     tools = all_type_tools()
     names = [tool["function"]["name"] for tool in tools]
-    assert names == [
-        "type_a_computational_scale",
-        "type_b_knowledge_boundary",
-        "type_c_reliable_execution",
-    ]
-
+    assert len(names) == len(set(names))
+    assert len(names) > 15
+    assert all("__" in name for name in names)
+    descriptions = "\n".join(tool["function"]["description"] for tool in tools)
+    assert "Category A" in descriptions
+    assert "Category B" in descriptions
+    assert "Category C" in descriptions

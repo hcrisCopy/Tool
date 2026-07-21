@@ -15,10 +15,14 @@ model:
   transformers_version: 4.55.2
 
 generation:
-  seeds: [20260721, 20260722, 20260723]
+  # Seed 0 is the exact vLLM default used by pinned When2Tool; 1/2 are the
+  # preregistered repeat-generation robustness runs.
+  seeds: [0, 1, 2]
   temperature: 0.7
   top_p: 0.8
   top_k: 20
+  repetition_penalty: 1.0
+  do_sample: true
   # Matches the pinned When2Tool extract_features.py and evaluation defaults.
   max_new_tokens: 2048
   max_rounds: 12
@@ -26,7 +30,9 @@ generation:
   tensor_parallel_size: 1
   gpu_memory_utilization: 0.90
 
-extraction_batch_size: 4
+# Batch 1 matches the pinned W2T extraction path exactly; no batch-dependent
+# BF16 kernel differences are admitted into the strict baseline.
+extraction_batch_size: 1
 
 analysis:
   seed: 20260721

@@ -8,6 +8,7 @@ implementation is not exposed through this adapter.
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 import sys
 from copy import deepcopy
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import REPO_ROOT
+from .constants import CATEGORY_NAMES, CATEGORY_TO_ENVS
 
 
 UPSTREAM_ROOT = REPO_ROOT / "third_party" / "when2tool"
@@ -88,3 +90,77 @@ def build_environment_tools(task: dict[str, Any]) -> list[dict[str, Any]]:
         for description in descriptions
     ]
 
+
+@lru_cache(maxsize=1)
+def build_all_candidate_tools() -> tuple[dict[str, Any], ...]:
+    """Build one fixed, executable P_all menu from every pinned env schema.
+
+    Names are environment-namespaced so collisions cannot silently route to a
+    different environment.  Every sample receives this exact tuple in this
+    exact order; therefore the menu cannot leak the sample's environment.
+    """
+
+    root = verify_upstream_checkout()
+    output: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    list_operations = {"append", "remove", "insert", "sort", "reverse"}
+    for category in ("A", "B", "C"):
+        for environment in CATEGORY_TO_ENVS[category]:
+            schema_path = root / "envs" / f"{environment}.json"
+            if not schema_path.is_file():
+                raise FileNotFoundError(schema_path)
+            schemas = json.loads(schema_path.read_text(encoding="utf-8"))
+            if not isinstance(schemas, list) or not schemas:
+                raise TypeError(f"Invalid tool schema file: {schema_path}")
+            for original in sorted(schemas, key=lambda item: str(item.get("name", ""))):
+                original_name = original.get("name")
+                if not isinstance(original_name, str) or not original_name:
+                    raise ValueError(f"Unnamed tool in {schema_path}")
+                if environment == "ListManipulationEnv" and original_name not in list_operations:
+                    continue
+                namespace = environment.removesuffix("Env").lower()
+                fixed_name = f"{namespace}__{original_name}"
+                if fixed_name in seen_names:
+                    raise ValueError(f"Duplicate P_all tool name: {fixed_name}")
+                seen_names.add(fixed_name)
+                function = deepcopy(original)
+                function["name"] = fixed_name
+                original_description = str(function.get("description", "")).strip()
+                prefix = (
+                    f"Category {category} ({CATEGORY_NAMES[category]}), "
+                    f"environment {environment}, operation {original_name}."
+                )
+                function["description"] = (
+                    f"{prefix} {original_description}".strip()
+                )
+                output.append({"type": "function", "function": function})
+    if not output:
+        raise AssertionError("Pinned P_all menu is empty")
+    return tuple(output)
+
+
+@lru_cache(maxsize=1)
+def load_upstream_runtime() -> tuple[Any, Any]:
+    """Import the exact pinned ``utils`` and ``model`` modules.
+
+    The upstream source uses top-level imports, so its ``src`` and repository
+    roots must be placed on ``sys.path``.  Existing modules with the same names
+    are rejected unless they resolve to the pinned checkout.
+    """
+
+    root = verify_upstream_checkout()
+    src = root / "src"
+    for path in (src, root):
+        path_text = str(path)
+        if path_text not in sys.path:
+            sys.path.insert(0, path_text)
+    modules = []
+    for name in ("utils", "model"):
+        module = importlib.import_module(name)
+        module_path = Path(module.__file__).resolve()
+        if root.resolve() not in module_path.parents:
+            raise ImportError(
+                f"Imported {name} from {module_path}, outside pinned checkout {root}"
+            )
+        modules.append(module)
+    return modules[0], modules[1]
