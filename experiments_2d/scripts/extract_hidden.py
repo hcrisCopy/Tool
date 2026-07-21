@@ -6,9 +6,11 @@ import argparse
 from datetime import datetime, timezone
 
 from experiments_2d.config import load_config, require_input_paths
+from experiments_2d.constants import HIDDEN_PROTOCOL_REVISION
 from experiments_2d.data import load_single_hop_split, smoke_subset
 from experiments_2d.hidden import extract_block_hidden
 from experiments_2d.io_utils import atomic_torch_save, atomic_write_json
+from experiments_2d.upstream import all_candidate_menu_sha256
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +76,8 @@ def main() -> None:
                     "dtype": str(hidden.dtype),
                     "extraction_batch_size": config.extraction_batch_size,
                     "enable_thinking": False,
+                    "protocol_revision": HIDDEN_PROTOCOL_REVISION,
+                    "p_all_menu_sha256": all_candidate_menu_sha256(),
                     "definition": (
                         "h0=embedding/block-1 input; h_l=raw decoder block l output; "
                         "last pre-generation prompt token"

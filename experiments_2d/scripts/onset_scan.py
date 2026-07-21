@@ -8,9 +8,19 @@ import json
 import torch
 
 from experiments_2d.config import load_config
-from experiments_2d.io_utils import atomic_torch_save, atomic_write_csv, atomic_write_json
+from experiments_2d.constants import HIDDEN_PROTOCOL_REVISION
+from experiments_2d.io_utils import (
+    atomic_torch_save,
+    atomic_write_csv,
+    atomic_write_json,
+    sha256_file,
+)
 from experiments_2d.onset import curve_rows, run_onset_analysis
 from experiments_2d.plotting import plot_necessity_onset, plot_type_onset
+from experiments_2d.upstream import (
+    EXPECTED_COMMIT,
+    all_candidate_menu_sha256,
+)
 
 
 CURVE_FIELDS = [
@@ -50,6 +60,16 @@ def _load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _require_manifest_fields(path, expected):
+    manifest = _load_json(path)
+    for key, expected_value in expected.items():
+        if manifest.get(key) != expected_value:
+            raise ValueError(
+                f"{path}: {key}={manifest.get(key)!r} != {expected_value!r}"
+            )
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -77,11 +97,52 @@ def main() -> None:
         / f"seed_{label_seed}"
         / "train_no_tool_outputs.json"
     )
+    label_manifest_path = label_path.with_name("train_manifest.json")
+    label_manifest = _require_manifest_fields(
+        label_manifest_path,
+        {
+            "split": "train",
+            "mode": args.mode,
+            "seed": label_seed,
+            "upstream_commit": EXPECTED_COMMIT,
+            "enable_thinking": False,
+            "max_new_tokens": config.generation.max_new_tokens,
+            "max_rounds": config.generation.max_rounds,
+            "temperature": config.generation.temperature,
+            "top_p": config.generation.top_p,
+            "top_k": config.generation.top_k,
+            "repetition_penalty": config.generation.repetition_penalty,
+            "do_sample": config.generation.do_sample,
+            "vllm_enable_v1_multiprocessing": False,
+            "single_gpu_adaptation": True,
+        },
+    )
     necessity_metadata = _load_json(
         hidden_root / "P_no_schema" / "train_metadata.json"
     )
     type_metadata = _load_json(hidden_root / "P_all" / "train_metadata.json")
     labels = _load_json(label_path)
+    if label_manifest.get("n") != len(labels):
+        raise ValueError("Label manifest count differs from label rows")
+    if any(row.get("seed") != label_seed for row in labels):
+        raise ValueError("At least one label row has the wrong generation seed")
+    if any(row.get("upstream_commit") != EXPECTED_COMMIT for row in labels):
+        raise ValueError("At least one label row is not from the pinned evaluator")
+    menu_sha256 = all_candidate_menu_sha256()
+    for variant in ("P_no_schema", "P_all"):
+        _require_manifest_fields(
+            hidden_root / variant / "train_manifest.json",
+            {
+                "split": "train",
+                "mode": args.mode,
+                "prompt_variant": variant,
+                "dtype": "torch.float32",
+                "extraction_batch_size": config.extraction_batch_size,
+                "enable_thinking": False,
+                "protocol_revision": HIDDEN_PROTOCOL_REVISION,
+                "p_all_menu_sha256": menu_sha256,
+            },
+        )
     necessity_ids = [row["id"] for row in necessity_metadata]
     type_ids = [row["id"] for row in type_metadata]
     label_ids = [row["id"] for row in labels]
@@ -101,6 +162,26 @@ def main() -> None:
         )
     if tuple(hidden_type.shape) != expected_shape:
         raise ValueError(f"P_all hidden shape {tuple(hidden_type.shape)} != {expected_shape}")
+    output_dir = (
+        config.run_root
+        / "onset"
+        / args.mode
+        / f"label_seed_{label_seed}"
+        / f"shuffles_{n_shuffles}"
+    )
+    expected_outputs = (
+        output_dir / "onset_summary.json",
+        output_dir / "onset_curves.csv",
+        output_dir / "residual_scalers.pt",
+        output_dir / "onset_tool_necessity_write_signal.png",
+        output_dir / "onset_category_write_signal.png",
+    )
+    existing = [path for path in expected_outputs if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "Onset outputs already exist; archive them before rerunning: "
+            + ", ".join(str(path) for path in existing)
+        )
     result, scalers = run_onset_analysis(
         hidden_necessity,
         hidden_type,
@@ -111,14 +192,15 @@ def main() -> None:
         max_window=config.analysis.max_onset_window,
         device=args.device,
     )
-    output_dir = (
-        config.run_root
-        / "onset"
-        / args.mode
-        / f"label_seed_{label_seed}"
-        / f"shuffles_{n_shuffles}"
-    )
     result["label_seed"] = label_seed
+    result["inputs"] = {
+        "labels_sha256": sha256_file(label_path),
+        "necessity_hidden_sha256": sha256_file(necessity_path),
+        "type_hidden_sha256": sha256_file(type_path),
+        "hidden_protocol_revision": HIDDEN_PROTOCOL_REVISION,
+        "p_all_menu_sha256": menu_sha256,
+        "upstream_commit": EXPECTED_COMMIT,
+    }
     atomic_write_json(output_dir / "onset_summary.json", result)
     atomic_write_csv(
         output_dir / "onset_curves.csv",

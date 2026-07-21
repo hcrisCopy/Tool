@@ -43,6 +43,10 @@ CATEGORY_NAMES: Final[dict[str, str]] = {
 
 DIFFICULTIES: Final[tuple[str, ...]] = ("easy", "medium", "hard")
 PROMPT_VARIANTS: Final[tuple[str, ...]] = ("P_env", "P_all", "P_no_schema")
+HIDDEN_PROTOCOL_REVISION: Final[str] = (
+    "raw-block-v2__w2t-current-no-reasoning__thinking-false__"
+    "pall-fixed-namespaced-unlabeled-menu"
+)
 
 # Expected cardinalities from the official single-hop benchmark release.
 EXPECTED_SPLIT_SIZES: Final[dict[str, int]] = {"train": 900, "test": 2250}

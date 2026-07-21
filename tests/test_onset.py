@@ -27,9 +27,9 @@ def test_standardization_uses_std_plus_epsilon() -> None:
     torch.testing.assert_close(standardized, expected, rtol=0, atol=0)
 
 
-def test_three_point_smoothing_replicates_edges() -> None:
+def test_three_point_smoothing_uses_available_boundary_layers() -> None:
     actual = _smooth_three(np.array([3.0, 6.0, 12.0]))
-    np.testing.assert_allclose(actual, np.array([4.0, 7.0, 10.0]))
+    np.testing.assert_allclose(actual, np.array([4.5, 7.0, 9.0]))
 
 
 def test_permutation_z_uses_null_std_plus_epsilon() -> None:
@@ -78,9 +78,19 @@ def test_vectorized_contrast_and_onset_selection() -> None:
 
 
 def test_fwhm_is_referenced_to_selected_onset_value() -> None:
-    # l*=2 has value 9.5 while the global peak is 10.  Layer 1 at 4.8 is
-    # included only when half-height is correctly based on 9.5 (threshold 4.75).
-    known = np.array([4.8, 9.5, 10.0, 4.7, 0.0, 0.0])
+    # l*=2 has value 9.5 while the global peak is 10.  Layers 1--5 at 4.8
+    # belong to the l*-referenced FWHM (threshold 4.75), but not the
+    # global-peak FWHM (threshold 5.0).
+    known = np.array([4.8, 9.5, 10.0, 4.8, 4.8, 0.0])
     onset = select_onset(known, peak_fraction=0.95, max_window=5)
     assert onset["onset_layer"] == 2
-    assert 1 in onset["window"]
+    assert 5 in onset["window"]
+
+
+def test_peak_ratio_uses_onset_and_excludes_onset_plus_minus_two() -> None:
+    known = np.array([1.0, 9.5, 10.0, 1.0, 2.0, 2.0, 2.0, 2.0])
+    onset = select_onset(known, peak_fraction=0.95, max_window=5)
+    assert onset["onset_layer"] == 2
+    assert onset["peak_layer"] == 3
+    assert onset["background_median"] == 2.0
+    assert onset["peak_ratio"] == 4.75

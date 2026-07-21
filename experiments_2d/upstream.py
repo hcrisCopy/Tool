@@ -7,17 +7,19 @@ implementation is not exposed through this adapter.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import subprocess
 import sys
 from copy import deepcopy
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .config import REPO_ROOT
-from .constants import CATEGORY_NAMES, CATEGORY_TO_ENVS
+from .constants import ENV_TO_CATEGORY
 
 
 UPSTREAM_ROOT = REPO_ROOT / "third_party" / "when2tool"
@@ -91,52 +93,98 @@ def build_environment_tools(task: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-@lru_cache(maxsize=1)
-def build_all_candidate_tools() -> tuple[dict[str, Any], ...]:
-    """Build one fixed, executable P_all menu from every pinned env schema.
+@dataclass(frozen=True)
+class ToolRoute:
+    exposed_name: str
+    category: str
+    environment: str
+    original_name: str
 
-    Names are environment-namespaced so collisions cannot silently route to a
-    different environment.  Every sample receives this exact tuple in this
-    exact order; therefore the menu cannot leak the sample's environment.
-    """
+
+@lru_cache(maxsize=1)
+def _all_candidate_menu() -> tuple[
+    tuple[dict[str, Any], ...], tuple[ToolRoute, ...], str
+]:
+    """Build the fixed, category-unlabeled P_all menu and reverse routes."""
 
     root = verify_upstream_checkout()
+    configured_environments = set(ENV_TO_CATEGORY)
+    registry_environments = set(_environment_registry())
+    if configured_environments != registry_environments:
+        raise ValueError(
+            "P_all environments differ from pinned registry: "
+            f"configured_only={sorted(configured_environments - registry_environments)}, "
+            f"registry_only={sorted(registry_environments - configured_environments)}"
+        )
     output: list[dict[str, Any]] = []
+    routes: list[ToolRoute] = []
     seen_names: set[str] = set()
-    list_operations = {"append", "remove", "insert", "sort", "reverse"}
-    for category in ("A", "B", "C"):
-        for environment in CATEGORY_TO_ENVS[category]:
-            schema_path = root / "envs" / f"{environment}.json"
-            if not schema_path.is_file():
-                raise FileNotFoundError(schema_path)
-            schemas = json.loads(schema_path.read_text(encoding="utf-8"))
-            if not isinstance(schemas, list) or not schemas:
-                raise TypeError(f"Invalid tool schema file: {schema_path}")
-            for original in sorted(schemas, key=lambda item: str(item.get("name", ""))):
-                original_name = original.get("name")
-                if not isinstance(original_name, str) or not original_name:
-                    raise ValueError(f"Unnamed tool in {schema_path}")
-                if environment == "ListManipulationEnv" and original_name not in list_operations:
-                    continue
-                namespace = environment.removesuffix("Env").lower()
-                fixed_name = f"{namespace}__{original_name}"
-                if fixed_name in seen_names:
-                    raise ValueError(f"Duplicate P_all tool name: {fixed_name}")
-                seen_names.add(fixed_name)
-                function = deepcopy(original)
-                function["name"] = fixed_name
-                original_description = str(function.get("description", "")).strip()
-                prefix = (
-                    f"Category {category} ({CATEGORY_NAMES[category]}), "
-                    f"environment {environment}, operation {original_name}."
+    # Global environment/name order is independent of the A/B/C target.
+    for environment in sorted(configured_environments):
+        schema_path = root / "envs" / f"{environment}.json"
+        if not schema_path.is_file():
+            raise FileNotFoundError(schema_path)
+        schemas = json.loads(schema_path.read_text(encoding="utf-8"))
+        if not isinstance(schemas, list) or not schemas:
+            raise TypeError(f"Invalid tool schema file: {schema_path}")
+        for original in sorted(schemas, key=lambda item: str(item.get("name", ""))):
+            original_name = original.get("name")
+            if not isinstance(original_name, str) or not original_name:
+                raise ValueError(f"Unnamed tool in {schema_path}")
+            namespace = environment.removesuffix("Env").lower()
+            fixed_name = f"{namespace}__{original_name}"
+            if fixed_name in seen_names:
+                raise ValueError(f"Duplicate P_all tool name: {fixed_name}")
+            seen_names.add(fixed_name)
+            function = deepcopy(original)
+            # Preserve official description/parameters verbatim.  Adding A/B/C
+            # text would leak the target that type onset is meant to discover.
+            function["name"] = fixed_name
+            output.append({"type": "function", "function": function})
+            routes.append(
+                ToolRoute(
+                    exposed_name=fixed_name,
+                    category=ENV_TO_CATEGORY[environment],
+                    environment=environment,
+                    original_name=original_name,
                 )
-                function["description"] = (
-                    f"{prefix} {original_description}".strip()
-                )
-                output.append({"type": "function", "function": function})
+            )
     if not output:
         raise AssertionError("Pinned P_all menu is empty")
-    return tuple(output)
+    canonical = json.dumps(
+        output, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return tuple(output), tuple(routes), hashlib.sha256(canonical).hexdigest()
+
+
+def build_all_candidate_tools() -> tuple[dict[str, Any], ...]:
+    """Return the fixed-order menu shared by every P_all sample."""
+
+    return _all_candidate_menu()[0]
+
+
+def all_candidate_tool_routes() -> tuple[ToolRoute, ...]:
+    """Return the frozen reverse-routing table for P_all calls."""
+
+    return _all_candidate_menu()[1]
+
+
+@lru_cache(maxsize=1)
+def _route_by_name() -> dict[str, ToolRoute]:
+    return {route.exposed_name: route for route in all_candidate_tool_routes()}
+
+
+def resolve_all_candidate_tool(exposed_name: str) -> ToolRoute:
+    """Resolve a known P_all name; unknown names fail explicitly."""
+
+    try:
+        return _route_by_name()[exposed_name]
+    except KeyError as error:
+        raise KeyError(f"Unknown P_all tool name: {exposed_name}") from error
+
+
+def all_candidate_menu_sha256() -> str:
+    return _all_candidate_menu()[2]
 
 
 @lru_cache(maxsize=1)

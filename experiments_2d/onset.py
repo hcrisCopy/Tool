@@ -58,11 +58,14 @@ def _smooth_three(values: np.ndarray) -> np.ndarray:
         raise ValueError("Smoothing expects a one-dimensional layer curve")
     if len(values) == 0:
         return np.empty(0, dtype=np.float64)
-    # Keep a literal three-point moving average at the two boundaries by
-    # replicating the nearest observed layer.  This convention is frozen so
-    # layer 1/36 cannot receive a lower-variance two-point average.
-    padded = np.pad(values.astype(np.float64, copy=False), (1, 1), mode="edge")
-    return np.convolve(padded, np.ones(3, dtype=np.float64) / 3.0, mode="valid")
+    # PDF §5.3: centered 3-point mean internally; at layer 1/L average only
+    # the adjacent available layers (a 2-point boundary mean).
+    smoothed = np.empty_like(values, dtype=np.float64)
+    for index in range(len(values)):
+        left = max(0, index - 1)
+        right = min(len(values), index + 2)
+        smoothed[index] = float(np.mean(values[left:right]))
+    return smoothed
 
 
 def _layer_scores_from_masks(
@@ -415,8 +418,10 @@ def run_onset_analysis(
         "protocol_conventions": {
             "standardization": "(r - train_mean) / (train_std + 1e-6)",
             "permutation_z": "(score - null_mean) / (null_std + 1e-6)",
-            "smoothing": "centered three-point mean with replicated edges",
+            "smoothing": "centered three-point mean; two available layers at boundaries",
             "fwhm_reference": "0.5 * smoothed_z_at_selected_onset",
+            "necessity_null": "label permutation within environment strata",
+            "type_null": "environment-to-category assignment permutation in blocks",
         },
         "clean_set_counts": {
             key: int(mask.sum()) for key, mask in sorted(clean.items())

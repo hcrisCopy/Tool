@@ -42,7 +42,8 @@ conda create -p ../CallTool_data/conda_envs/calltool_qwen3 python=3.11 -y
 
 三个 prompt variant 已冻结：`P_env` 使用样本原始工具列表；`P_no_schema` 不给工具
 schema；`P_all` 给每条样本完全相同、按 environment 命名空间隔离的全候选工具菜单。
-因此 `P_all` 既不会泄漏当前 environment，后续也能实际统计 wrong-category calls。
+菜单不写入 A/B/C 标签或类别分组，并保存唯一反向路由表；后续执行器完成后可据此分别
+统计 WrongType、WrongEnv 和 InvalidTool。
 
 ## 当前阶段命令
 
@@ -57,7 +58,7 @@ $PY -m experiments_2d.scripts.prepare_data
 # 2. 先取每个 environment × difficulty 一条，共 45 条，生成官方 hard-no-tool 标签
 $PY -m experiments_2d.scripts.prepare_labels --smoke
 
-# 3. 主标签：seed=0 与固定 When2Tool/vLLM 默认完全一致
+# 3. 主标签：固定 W2T 协议 + 可复现的预注册 seed 0
 $PY -m experiments_2d.scripts.prepare_labels --split train
 $PY -m experiments_2d.scripts.prepare_labels --split test
 
@@ -79,8 +80,12 @@ $PY -m experiments_2d.scripts.prepare_labels --seed 2 --split test
 ```
 
 标签直接复用固定上游的 prompt、parser、state machine 与 scorer，并在 hard-no-tool
-分支额外安装“任何工具执行即报错”的安全闸。seed 0 只显式写出 vLLM 原本的默认值；
-seed 1/2 仅改变生成随机种子。任何旧产物都必须先归档，脚本不会把旧结果当成新结果。
+分支额外安装“任何工具执行即报错”的安全闸。固定上游基于 vLLM 0.8.5，原实现使用
+`seed=None`，无法逐次重放论文当时的随机流；本项目将 0 定为主 seed，1/2 只改变随机
+种子，并对 train/test 分别重置，同时关闭 vLLM V1 multiprocessing，保证三次设置可
+复现。论文上游默认 4 卡，本项目按第一阶段要求固定单张 GPU；因此这里复现的是固定上游
+算法与评测协议，不声称逐 bit 重放论文未记录的随机运行。任何旧产物都必须先归档，脚本
+不会把旧结果当成新结果。
 
 每个阶段都会写 manifest、配置快照和进度日志。神经元选择、因果干预与
 Probe&Prefill 命令将在对应实现完成并通过冒烟后补充。

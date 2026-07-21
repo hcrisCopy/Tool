@@ -26,12 +26,19 @@ def _seed_everything(seed: int) -> None:
 def _build_pinned_agent(config: ExperimentConfig, seed: int) -> Any:
     """Construct the exact upstream AgentModel, adding only an explicit LLM seed.
 
-    Seed 0 is identical to vLLM's upstream default.  Seeds 1 and 2 are repeat
-    runs; no parser, prompt, state-machine, or sampling parameter is changed.
+    The pinned vLLM backend leaves its seed unspecified.  We explicitly set a
+    preregistered seed so all three runs are reproducible; no parser, prompt,
+    state-machine, or sampling parameter is changed.
     """
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    multiprocessing = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+    if multiprocessing not in (None, "0"):
+        raise ValueError(
+            "VLLM_ENABLE_V1_MULTIPROCESSING must be 0 for seeded reproducibility"
+        )
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     _, upstream_model = load_upstream_runtime()
     import vllm
 
@@ -140,7 +147,8 @@ def _normalize_output(
         "prompt_variant": "P_env",
         "prompt_hash": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
         "rounds": int(output["rounds"]),
-        "completed": bool(output.get("final_response")),
+        "completed": bool(output.get("final_response"))
+        and output.get("final_response") != "[CONTEXT_LENGTH_EXCEEDED]",
         "final_response": raw,
         "boxed_answer": boxed,
         "cleaned_answer": cleaned,

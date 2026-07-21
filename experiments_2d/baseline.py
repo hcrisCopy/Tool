@@ -12,9 +12,13 @@ import torch
 from safetensors import safe_open
 
 from .config import ExperimentConfig
-from .constants import EXPECTED_SPLIT_SIZES
+from .constants import EXPECTED_SPLIT_SIZES, HIDDEN_PROTOCOL_REVISION
 from .io_utils import atomic_torch_save, atomic_write_json, sha256_file
-from .upstream import EXPECTED_COMMIT, verify_upstream_checkout
+from .upstream import (
+    EXPECTED_COMMIT,
+    all_candidate_menu_sha256,
+    verify_upstream_checkout,
+)
 
 
 def _load_final_norm(model_root: Path) -> tuple[torch.Tensor, float]:
@@ -78,6 +82,18 @@ def _baseline_labels(rows: list[dict[str, Any]], split: str) -> dict[str, Any]:
     }
 
 
+def _require_manifest(path: Path, expected: dict[str, Any]) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    for key, expected_value in expected.items():
+        if manifest.get(key) != expected_value:
+            raise ValueError(
+                f"{path}: {key}={manifest.get(key)!r} != {expected_value!r}"
+            )
+    return manifest
+
+
 def materialize_w2t_inputs(config: ExperimentConfig) -> Path:
     """Create the exact files consumed by upstream train_probe.py."""
 
@@ -118,6 +134,34 @@ def materialize_w2t_inputs(config: ExperimentConfig) -> Path:
         if not metadata_path.is_file():
             raise FileNotFoundError(metadata_path)
         hidden_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        _require_manifest(
+            metadata_path.with_name(f"{split}_manifest.json"),
+            {
+                "split": split,
+                "mode": "full",
+                "prompt_variant": "P_env",
+                "dtype": "torch.float32",
+                "extraction_batch_size": config.extraction_batch_size,
+                "enable_thinking": False,
+                "protocol_revision": HIDDEN_PROTOCOL_REVISION,
+                "p_all_menu_sha256": all_candidate_menu_sha256(),
+            },
+        )
+        label_manifest = _require_manifest(
+            labels_path.with_name(f"{split}_manifest.json"),
+            {
+                "split": split,
+                "mode": "full",
+                "seed": config.generation.seeds[0],
+                "upstream_commit": EXPECTED_COMMIT,
+                "enable_thinking": False,
+                "max_new_tokens": config.generation.max_new_tokens,
+                "max_rounds": config.generation.max_rounds,
+                "repetition_penalty": config.generation.repetition_penalty,
+                "vllm_enable_v1_multiprocessing": False,
+                "single_gpu_adaptation": True,
+            },
+        )
         expected_shape = (
             EXPECTED_SPLIT_SIZES[split],
             config.model.num_hidden_layers + 1,
@@ -131,6 +175,8 @@ def materialize_w2t_inputs(config: ExperimentConfig) -> Path:
             raise ValueError(
                 f"{split}: label count {len(rows)} != {EXPECTED_SPLIT_SIZES[split]}"
             )
+        if label_manifest.get("n") != len(rows):
+            raise ValueError(f"{split}: label manifest count differs from rows")
         hidden_ids = [row["id"] for row in hidden_metadata]
         label_ids = [row["id"] for row in rows]
         if hidden_ids != label_ids:

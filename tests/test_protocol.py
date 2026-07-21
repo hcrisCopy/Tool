@@ -1,7 +1,12 @@
 from experiments_2d.config import load_config
 from experiments_2d.constants import DIFFICULTIES, ENV_TO_CATEGORY
 from experiments_2d.data import smoke_subset
-from experiments_2d.prompting import all_type_tools
+from experiments_2d.prompting import all_type_tools, tools_for_variant
+from experiments_2d.upstream import (
+    all_candidate_menu_sha256,
+    all_candidate_tool_routes,
+    resolve_all_candidate_tool,
+)
 
 
 def test_config_freezes_single_gpu_qwen_protocol() -> None:
@@ -42,9 +47,19 @@ def test_p_all_menu_is_fixed_namespaced_all_candidate_tools() -> None:
     tools = all_type_tools()
     names = [tool["function"]["name"] for tool in tools]
     assert len(names) == len(set(names))
-    assert len(names) > 15
+    assert len(names) == 33
     assert all("__" in name for name in names)
     descriptions = "\n".join(tool["function"]["description"] for tool in tools)
-    assert "Category A" in descriptions
-    assert "Category B" in descriptions
-    assert "Category C" in descriptions
+    assert "Category A" not in descriptions
+    assert "Category B" not in descriptions
+    assert "Category C" not in descriptions
+    assert tools_for_variant({"id": 1}, "P_all") == tools_for_variant(
+        {"id": 2, "environments": []}, "P_all"
+    )
+    routes = all_candidate_tool_routes()
+    assert len(routes) == len(tools)
+    assert {route.category for route in routes} == {"A", "B", "C"}
+    assert len({route.environment for route in routes}) == 15
+    for route in routes:
+        assert resolve_all_candidate_tool(route.exposed_name) == route
+    assert len(all_candidate_menu_sha256()) == 64
