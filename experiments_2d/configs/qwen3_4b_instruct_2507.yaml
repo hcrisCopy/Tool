@@ -29,8 +29,9 @@ extraction_batch_size: 4
 
 analysis:
   seed: 20260721
-  n_label_shuffles_smoke: 200
-  n_label_shuffles_final: 2000
+  # PDF primary result and a preregistered robustness rerun.
+  n_label_shuffles_primary: 200
+  n_label_shuffles_robustness: 2000
   n_onset_bootstraps: 500
   n_selection_bootstraps: 500
   n_metric_bootstraps: 10000

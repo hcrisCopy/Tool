@@ -61,8 +61,8 @@ class GenerationSpec:
 @dataclass(frozen=True)
 class AnalysisSpec:
     seed: int
-    n_label_shuffles_smoke: int
-    n_label_shuffles_final: int
+    n_label_shuffles_primary: int
+    n_label_shuffles_robustness: int
     n_onset_bootstraps: int
     n_selection_bootstraps: int
     n_metric_bootstraps: int
@@ -164,11 +164,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
     )
     analysis = AnalysisSpec(
         seed=int(_require(raw_analysis, "seed", "analysis")),
-        n_label_shuffles_smoke=int(
-            _require(raw_analysis, "n_label_shuffles_smoke", "analysis")
+        n_label_shuffles_primary=int(
+            _require(raw_analysis, "n_label_shuffles_primary", "analysis")
         ),
-        n_label_shuffles_final=int(
-            _require(raw_analysis, "n_label_shuffles_final", "analysis")
+        n_label_shuffles_robustness=int(
+            _require(raw_analysis, "n_label_shuffles_robustness", "analysis")
         ),
         n_onset_bootstraps=int(
             _require(raw_analysis, "n_onset_bootstraps", "analysis")
