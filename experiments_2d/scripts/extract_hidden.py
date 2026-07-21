@@ -48,8 +48,19 @@ def main() -> None:
         if args.smoke:
             tasks = smoke_subset(tasks)
         for variant in variants:
-            hidden, metadata, validation = extract_block_hidden(tasks, config, variant)
             output_dir = config.run_root / "hidden" / mode / variant
+            expected_outputs = (
+                output_dir / f"{split}_hidden.pt",
+                output_dir / f"{split}_metadata.json",
+                output_dir / f"{split}_manifest.json",
+            )
+            existing = [path for path in expected_outputs if path.exists()]
+            if existing:
+                raise FileExistsError(
+                    "Hidden outputs already exist; archive them before rerunning: "
+                    + ", ".join(str(path) for path in existing)
+                )
+            hidden, metadata, validation = extract_block_hidden(tasks, config, variant)
             atomic_torch_save(output_dir / f"{split}_hidden.pt", hidden)
             atomic_write_json(output_dir / f"{split}_metadata.json", metadata)
             atomic_write_json(
@@ -61,6 +72,8 @@ def main() -> None:
                     "prompt_variant": variant,
                     "shape": list(hidden.shape),
                     "dtype": str(hidden.dtype),
+                    "extraction_batch_size": config.extraction_batch_size,
+                    "enable_thinking": False,
                     "definition": (
                         "h0=embedding/block-1 input; h_l=raw decoder block l output; "
                         "last pre-generation prompt token"
@@ -73,4 +86,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
