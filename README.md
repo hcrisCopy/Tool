@@ -38,7 +38,7 @@
                 └── reports/                   # 阶段报告的数据盘副本
 ```
 
-所有命令均从 `CallTool_code/` 执行。仓库目录请保持为 `CallTool_code`；代码使用相对路径，不依赖个人电脑或服务器绝对路径。
+所有命令均从 `CallTool_code/` 执行。仓库目录请保持为 `CallTool_code`；代码使用相对路径，不依赖个人电脑或服务器绝对路径。首次克隆时需同时取得仓库中的 When2Tool 子模块，已有服务器目录无需重复操作。
 
 ## 环境配置
 
@@ -46,8 +46,6 @@
 conda create --prefix ../CallTool_data/conda_envs/calltool_qwen3 python=3.11 -y
 conda activate ../CallTool_data/conda_envs/calltool_qwen3
 pip install -r requirements.txt
-git submodule update --init --recursive
-pytest -q
 ```
 
 验证环境：CUDA 12.4、PyTorch 2.6.0、Transformers 4.55.2、vLLM 0.8.5。
