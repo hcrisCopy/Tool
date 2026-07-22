@@ -123,6 +123,21 @@ def _route_and_record(
     info = state["route_map"].get(tool_name)
     recognized = info is not None
     arguments_valid, validation_error = validate_tool_arguments(tool_name, arguments)
+    event = {
+        "round": state["rounds"],
+        "tool_name": tool_name,
+        "arguments": deepcopy(arguments),
+        "recognized": recognized,
+        "environment": info.environment if info else None,
+        "category": info.category if info else "INVALID",
+        "arguments_valid": bool(arguments_valid),
+        "result_success": None,
+        "result": None,
+        "routed": True,
+    }
+    # Persist the routing decision before execution.  This keeps the behavioral
+    # choice auditable even if a guarded tool later times out.
+    state["routed_tool_events"].append(event)
     result: dict[str, Any]
     if not recognized:
         result = {
@@ -151,19 +166,9 @@ def _route_and_record(
                 result = env.call_tool(tool_name, arguments)
         except TimeoutError as error:
             result = {"success": False, "message": f"[TOOL_RUNTIME_TIMEOUT] {error}"}
-    event = {
-        "round": state["rounds"],
-        "tool_name": tool_name,
-        "arguments": deepcopy(arguments),
-        "recognized": recognized,
-        "environment": info.environment if info else None,
-        "category": info.category if info else "INVALID",
-        "arguments_valid": bool(arguments_valid),
-        "result_success": bool(result.get("success")),
-        "result": compact_json(deepcopy(result)),
-        "routed": True,
-    }
-    state["routed_tool_events"].append(event)
+    event["arguments_valid"] = bool(arguments_valid)
+    event["result_success"] = bool(result.get("success"))
+    event["result"] = compact_json(deepcopy(result))
     return result
 
 
@@ -187,6 +192,13 @@ def _trace_item(state: dict[str, Any], out: dict[str, Any]) -> dict[str, Any] | 
             if out.get("type") == "content"
             else None,
         },
+        "attempted_tool_parse_failure": bool(
+            out.get("type") != "tool"
+            and (
+                "<tool_call>" in str(out.get("raw_text", ""))
+                or "\"name\"" in str(out.get("raw_text", ""))
+            )
+        ),
     }
     if state["record_mode"] == "full":
         item["prompt_text"] = prompt
@@ -239,6 +251,23 @@ def _finalize(
     _raw, _boxed, _cleaned, final_correct = utils.item_final_eval(result)
     gold_tools = set(result["gold_tools"])
     first = events[0] if events else None
+    gold_action = result.get("gold_action")
+    error_type: str | None = None
+    if gold_action in ACTIONS:
+        if "INVALID" in categories:
+            error_type = "invalid_tool"
+        elif gold_action == "NONE" and pred_action != "NONE":
+            error_type = "over_call"
+        elif gold_action != "NONE" and pred_action == "NONE":
+            error_type = "under_call"
+        elif gold_action != "NONE" and pred_action != gold_action:
+            error_type = "wrong_category"
+        elif not final_correct and pred_action == "NONE":
+            error_type = "direct_answer_wrong"
+        elif not final_correct:
+            error_type = "correct_category_wrong_answer"
+        else:
+            error_type = "success"
     result.update(
         {
             "schema_version": SCHEMA_VERSION,
@@ -262,6 +291,13 @@ def _finalize(
             "mixed_category_calls": len(set(categories)) >= 2,
             "invalid_tool_calls": sum(category == "INVALID" for category in categories),
             "final_correct": bool(final_correct),
+            "error_type": error_type,
+            "episode_done": bool(state["done"]),
+            "termination_reason": "boxed_answer" if state["done"] else "max_rounds",
+            "tool_parse_failures": sum(
+                bool(item.get("attempted_tool_parse_failure"))
+                for item in state.get("trace", [])
+            ),
         }
     )
     return result

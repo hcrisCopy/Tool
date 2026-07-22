@@ -50,7 +50,7 @@ def main() -> None:
         tool_scope=args.tool_scope,
         prompt_mode="hard_no_tool",
         require_reasoning=False,
-        record_mode="off",
+        record_mode="lite",
     )
     agent = build_agent(config)
     set_generation_seed(agent, seed, config.generation.repetition_penalty)

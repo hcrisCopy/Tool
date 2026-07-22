@@ -45,6 +45,10 @@ def build_label_rows(
                 "reasoning_mode": "no_reasoning",
                 "tool_scope": tool_scope,
                 "final_response": row.get("final_response", ""),
+                "episode_done": row.get("episode_done"),
+                "termination_reason": row.get("termination_reason"),
+                "rounds": row.get("rounds"),
+                "tool_parse_failures": row.get("tool_parse_failures", 0),
             }
         )
     return labels
