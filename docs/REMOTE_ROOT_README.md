@@ -1,32 +1,23 @@
 # CallTool 服务器交接入口
 
-本目录采用代码与大文件分离布局：
+## 目录
 
 ```text
 CallTool/
 ├── README.md
-├── CallTool_code/   # Git 仓库、配置、测试与小型文档
-└── CallTool_data/   # Conda 环境、When2Tool、hidden、行为输出与分析
+├── CallTool_code/   # Git 仓库、配置、测试和文档
+└── CallTool_data/   # 环境、数据和大型实验产物
 ```
 
-共享基础模型不在项目内重复保存，固定从本目录的同级路径 `../Qwen/Qwen3-4B-Instruct-2507/` 读取。
+共享模型放在同级 `../Qwen/Qwen3-4B-Instruct-2507/`，不在项目内重复保存。
 
-当前 Qwen3-4B-Instruct-2507 single-hop 已完成数据改造、冻结模型相关标签、full/scoped residual probes，以及第 5 阶段 FFN intermediate `(layer, neuron_idx)` 的正式探测。Stage 5 的 9/9 组均完整；预注册 `.003_signed` primary 的 binary Accuracy/Balanced Accuracy/Macro-F1/AUROC 为 `.8018/.7923/.7917/.8827`，四动作为 `.6031/.3365/.3101/.9349`。这对 H1 是有限但明确的支持，不是因果证据。第 6-8 阶段的 25 条件因果 mask、target/dense/random masked-LoRA 与 scoped/full 评测代码已准备，但尚未正式运行；未检查因果门槛前不得直接训练。
+## 当前做到哪里
 
-权威入口：
+- 已完成数据改造、冻结标签、residual probes 和 Stage 5 FFN 神经元探测。
+- Stage 5 有限但明确地支持“FFN 中存在可探测的动作信号”；它仍然不是因果证据。
+- Stage 6–8 的因果验证、masked LoRA 和训练后评测代码已准备，尚未正式运行。
 
-- 操作手册：`CallTool_code/README.md`
-- 当前阶段报告：`CallTool_code/reports/stages/STAGE_STATISTICS_QWEN3_4B.md`
-- 第 5 阶段以后交接：`CallTool_code/docs/STAGE5_PLUS_HANDOFF.md`
-- 研究定位与主张边界：`CallTool_code/docs/RESEARCH_POSITIONING.md`
-- 大文件清单：`CallTool_code/docs/data_manifest.md`
-- 数据目录说明：`CallTool_data/README.md`
-- 生成 provenance：`CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507/manifests/runtime_provenance.json`
-- Stage 5 provenance：`CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507/stages/05_probing/manifests/runtime_provenance.json`，SHA256 `0a78f15d5327f90038792213da5a7798896d0e79532ee47d6e4b44541d12ed24`
-
-旧统计行为面板仍是 partial checkpoint；它不阻塞以冻结 labels 开展 FFN 探测，但最终与 Prompt-only/Probe&Prefill 的完整论文比较仍需补齐。不要把旧统计的全局 runtime receipt 覆盖为新代码提交；第 5-8 阶段各自使用 `stages/<stage>/manifests/runtime_provenance.json`。
-
-从本目录恢复环境与运行测试：
+## 接手后先做
 
 ```bash
 cd CallTool_code
@@ -35,16 +26,23 @@ python -m pip check
 python -m pytest -q
 ```
 
-Git clone 只包含代码，不能代替 `CallTool_data/` 与共享模型快照。“partial”仅指旧统计行为/P&P 面板；第 5 阶段本身已经独立完整。恢复时先核对各自 runtime provenance、产物 manifest/receipt 与阶段报告列出的 SHA；旧行为完整面板结束后再按 `stage_handoff.json` 逐文件验证。不要重新创建已经清理的旧 `experiments_2d` 方案树。
-
-第 5 阶段命令仅用于在新的输出 `RUN_ROOT` 复现；当前正式目录已有产物时不得直接重跑。`INPUT_RUN_ROOT` 默认仍指向正式根并只读取其中的 `data/`、`labels/`，所以新输出根不需要复制输入。第 6-8 阶段的一键入口依次为：
+阶段入口依次为：
 
 ```bash
-RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica bash scripts/run_stage5_probing.sh
-bash scripts/run_stage6_causal.sh
-STAGE_START=source bash scripts/run_stage7_training.sh
-CAUSAL_GATE_PASSED=1 STAGE_START=training NPROC_PER_NODE=8 bash scripts/run_stage7_training.sh
-bash scripts/run_stage8_evaluation.sh
+python scripts/run_stage5_probing.py --run-root ../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica
+python scripts/run_stage6_causal.py
+python scripts/run_stage7_training.py --step prepare
+python scripts/run_stage7_training.py --step train --causal-gate-passed
+python scripts/run_stage8_evaluation.py --step all
 ```
 
-具体参数、恢复方式、输出和成功判据只以 `CallTool_code/README.md` 与阶段交接文档为准。
+Stage 5 的正式目录已有产物，不要原地重跑。上面的命令把复现结果写到 `-replica` 目录；`--start activations` 只抽 activation，`--start discovery` 复用完整 activation 做探测。Stage 8 可用 `--step evaluation|summary` 分步恢复。具体参数和输出目录见 `CallTool_code/README.md`。
+
+## 文档入口
+
+- 操作手册：`CallTool_code/README.md`
+- Stage 5–8 结果与实验矩阵：`CallTool_code/docs/STAGE5_PLUS_HANDOFF.md`
+- 研究定位与结论边界：`CallTool_code/docs/RESEARCH_POSITIONING.md`
+- 数据与 SHA：`CallTool_code/docs/data_manifest.md`
+- 旧统计阶段：`CallTool_code/reports/stages/STAGE_STATISTICS_QWEN3_4B.md`
+- 数据目录说明：`CallTool_data/README.md`
