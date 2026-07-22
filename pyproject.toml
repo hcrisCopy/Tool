@@ -3,15 +3,14 @@ requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "calltool-2d"
-version = "0.1.0"
-description = "Layer-onset and hidden-state-neuron analysis for two-dimensional tool decisions"
+name = "when2tool-action"
+version = "0.2.0"
+description = "Full-menu NONE/A/B/C action analysis and Precise-Shield-style tool-neuron experiments"
 requires-python = ">=3.11,<3.12"
 
 [tool.setuptools.packages.find]
-include = ["experiments_2d*"]
+include = ["when2tool_action*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-

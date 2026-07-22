@@ -1,0 +1,32 @@
+paths:
+  model: ../../Qwen/Qwen3-4B-Instruct-2507
+  dataset: ../CallTool_data/When2Tool
+  output_root: ../CallTool_data/when2tool_precise_shield
+
+model:
+  slug: qwen3-4b-instruct-2507
+  architecture: Qwen3ForCausalLM
+  num_hidden_layers: 36
+  hidden_size: 2560
+
+generation:
+  seeds: [0, 1, 2]
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.0
+  max_new_tokens: 2048
+  max_rounds: 12
+  max_model_len: 32768
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.90
+
+probe:
+  c: 0.0001
+  temperature: 2.0
+  thresholds: [0.1, 0.3, 0.5, 0.7, 0.9]
+
+extraction_batch_size: 1
+statistics:
+  seed: 20260722
+  bootstrap_replicates: 10000
