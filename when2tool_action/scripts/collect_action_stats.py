@@ -31,6 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260722)
     parser.add_argument(
+        "--expected-seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Require every setting to contain exactly this seed panel. "
+            "Omit for intentionally partial smoke analysis."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Permit replacing this command's files in an existing output directory.",
@@ -47,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         overwrite=args.overwrite,
         n_bootstrap=args.bootstrap_samples,
         bootstrap_seed=args.bootstrap_seed,
+        expected_seeds=args.expected_seeds,
     )
     print(
         json.dumps(

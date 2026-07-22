@@ -19,6 +19,38 @@ from .runtime import EvaluationSetting, initial_messages_and_tools
 from .upstream import full_menu_sha256, load_runtime
 
 
+def hidden_output_paths(
+    output_dir: Path, splits: tuple[str, ...] = ("train", "test")
+) -> tuple[Path, ...]:
+    """Return every artifact path written by a hidden-state extraction run."""
+
+    return tuple(
+        output_dir / filename
+        for split in splits
+        for filename in (
+            f"{split}_hidden_no_reasoning.pt",
+            f"{split}_labels_no_reasoning.json",
+            f"{split}_hidden_manifest.json",
+        )
+    )
+
+
+def preflight_hidden_outputs(output_dir: Path, *, overwrite: bool) -> None:
+    """Reject collisions for both splits before allocating/loading the model."""
+
+    if output_dir.exists() and not output_dir.is_dir():
+        raise NotADirectoryError(
+            f"Hidden extraction output path is not a directory: {output_dir}"
+        )
+    existing = [path for path in hidden_output_paths(output_dir) if path.exists()]
+    if existing and not overwrite:
+        formatted = "\n".join(f"  - {path}" for path in existing)
+        raise FileExistsError(
+            "Refusing to start hidden extraction because output artifacts already "
+            f"exist; pass --overwrite explicitly:\n{formatted}"
+        )
+
+
 def _load_labels(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -206,6 +238,7 @@ def extract_all(
     tool_scope: str,
     overwrite: bool,
 ) -> None:
+    preflight_hidden_outputs(output_dir, overwrite=overwrite)
     _seed(config.generation.seeds[0])
     model, tokenizer = _load_model(config)
     output_dir.mkdir(parents=True, exist_ok=True)

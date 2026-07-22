@@ -59,9 +59,24 @@ bash scripts/run_statistics_stage.sh
 
 如需分步执行，直接查看 [scripts/run_statistics_stage.sh](scripts/run_statistics_stage.sh)，每条命令都是独立入口。
 
+## 可选：导入原始 scoped When2Tool baseline
+
+旧实验中的原始 `P_env` binary probe 只能作为论文原始 scoped baseline，不能称为当前流水线的 `scoped-adapted` probe。导入命令不会被统计总脚本隐式调用；确认旧资产仍在后，显式执行：
+
+```bash
+python -m when2tool_action.scripts.import_legacy_scoped \
+  --config when2tool_action/configs/qwen3_4b_instruct_2507.yaml \
+  --legacy-root ../CallTool_data/experiments_2d/qwen3-4b-instruct-2507 \
+  --output-root ../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507 \
+  --transfer-mode hardlink
+```
+
+脚本会逐项验证 manifest 与文件 SHA256、hidden shape/dtype/finite、所有 task/prompt hash、`C=1e-4` all-layer probe，并按官方双 `StandardScaler` 路径重算全部保存指标。`hardlink` 不复制数 GB hidden 数据；如果源与目标不在同一文件系统，请显式改成 `--transfer-mode copy`，程序不会静默回退。输出固定隔离在 `probes/scoped_original_w2t/` 和 `*_scoped_original_w2t.json`，审计结论写入 `migration_receipt.json`。
+
 ## 关键实验契约
 
 - 数据中始终只保存 gold environment；`--tool-scope full` 只在运行时创建 15 个新环境实例并注入固定 33-tool menu。
+- `ListManipulation` 格式说明按“菜单是否暴露该工具”决定：scoped 仅 List 任务加入，full-tools 则所有任务统一加入；绝不按 full-tools 的 gold environment 条件化 system message。
 - 全工具按 environment/name 固定排序，菜单保存 SHA256；不重命名工具，不在 prompt 泄露 A/B/C、gold env 或 gold tool。
 - `total_tool_calls` 只统计通过 reasoning/no-tool 检查、真正进入路由器的调用。显式断言 `len(routed_tool_events) == tool_calls`。
 - 无调用为 `NONE`；否则首个 routed event 的类别为 `A/B/C`。未知工具为 `INVALID`，不能静默塞入四类。

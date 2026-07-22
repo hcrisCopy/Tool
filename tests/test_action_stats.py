@@ -12,6 +12,7 @@ from when2tool_action.stats import (
     compute_per_run_metrics,
     load_evaluation_outputs,
     paired_bootstrap_comparisons,
+    validate_expected_seed_panel,
 )
 
 
@@ -243,6 +244,42 @@ def test_requires_identical_id_sets_across_runs(tmp_path: Path) -> None:
         load_evaluation_outputs([path])
 
 
+def test_formal_seed_panel_is_exact_and_checked_before_writing(tmp_path: Path) -> None:
+    path = tmp_path / "two_seeds.json"
+    _write(path, _payload("current", [("NONE", [], True), ("A", ["A"], True)]))
+    output_dir = tmp_path / "must-not-be-created"
+
+    with pytest.raises(ValueError, match=r"expected=\[0, 1, 2\].*actual=\[0, 1\]"):
+        collect_action_statistics(
+            [path],
+            output_dir,
+            expected_seeds=(0, 1, 2),
+            n_bootstrap=20,
+        )
+
+    assert not output_dir.exists()
+    frame = load_evaluation_outputs([path])
+    assert validate_expected_seed_panel(frame, (0, 1)) == (0, 1)
+    with pytest.raises(ValueError, match="must be unique"):
+        validate_expected_seed_panel(frame, (0, 0))
+
+
+def test_single_seed_smoke_requires_omitting_expected_panel(tmp_path: Path) -> None:
+    path = tmp_path / "smoke.json"
+    payload = _payload("current_smoke", [("NONE", [], True), ("A", ["A"], True)])
+    payload["runs"] = payload["runs"][:1]
+    _write(path, payload)
+
+    frame = load_evaluation_outputs([path])
+    with pytest.raises(ValueError, match=r"actual=\[0\]"):
+        validate_expected_seed_panel(frame, (0, 1, 2))
+    summary = collect_action_statistics(
+        [path], tmp_path / "smoke_stats", n_bootstrap=20
+    )
+    assert summary["expected_seeds"] is None
+    assert summary["n_runs"] == 1
+
+
 def test_paired_bootstrap_is_deterministic_and_signed(tmp_path: Path) -> None:
     left_path = tmp_path / "a.json"
     right_path = tmp_path / "b.json"
@@ -327,8 +364,10 @@ def test_full_collection_writes_tables_plots_and_label_distribution(
         labels_path=labels,
         n_bootstrap=20,
         bootstrap_seed=3,
+        expected_seeds=(0, 1),
     )
     assert summary["n_rows"] == 8
+    assert summary["expected_seeds"] == [0, 1]
     expected = {
         "summary.json",
         "derived_action_rows.csv",

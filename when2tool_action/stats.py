@@ -422,6 +422,40 @@ def _validate_evaluation_frame(frame: pd.DataFrame) -> None:
         )
 
 
+def validate_expected_seed_panel(
+    frame: pd.DataFrame, expected_seeds: Sequence[int]
+) -> tuple[int, ...]:
+    """Require an exact seed set for every experimental setting.
+
+    Callers opt in to this formal-panel check by passing ``expected_seeds``.
+    Intentionally partial smoke analyses must omit that argument explicitly.
+    """
+
+    normalized: list[int] = []
+    for index, seed in enumerate(expected_seeds):
+        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+            raise TypeError(
+                f"expected_seeds[{index}] must be an integer, got {seed!r}"
+            )
+        normalized.append(int(seed))
+    if not normalized:
+        raise ValueError("expected_seeds must be non-empty when provided")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"expected_seeds must be unique, got {normalized}")
+
+    expected = set(normalized)
+    for setting, group in frame.groupby("setting", sort=True):
+        actual = {int(seed) for seed in group["seed"].unique()}
+        if actual != expected:
+            raise ValueError(
+                f"Setting {setting!r} does not have the exact expected seed panel; "
+                f"expected={sorted(expected)}, actual={sorted(actual)}, "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+    return tuple(normalized)
+
+
 def _safe_rate(numerator: int | float, denominator: int, context: str) -> float:
     if denominator == 0:
         return math.nan
@@ -1255,6 +1289,7 @@ def _summary_payload(
     labels_path: Path | None,
     n_bootstrap: int,
     bootstrap_seed: int,
+    expected_seeds: tuple[int, ...] | None,
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {}
     for setting, group in run_summary.groupby("setting", sort=True):
@@ -1276,6 +1311,7 @@ def _summary_payload(
         "n_task_ids": int(frame["id"].nunique()),
         "n_settings": int(frame["setting"].nunique()),
         "n_runs": int(len(per_run)),
+        "expected_seeds": None if expected_seeds is None else list(expected_seeds),
         "actions": list(ACTIONS),
         "prediction_columns": list(PREDICTIONS),
         "outcome_plot_order": list(OUTCOME_ORDER),
@@ -1321,6 +1357,7 @@ def collect_action_statistics(
     overwrite: bool = False,
     n_bootstrap: int = 10000,
     bootstrap_seed: int = 20260722,
+    expected_seeds: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Validate evaluation outputs and write all statistics and plots."""
 
@@ -1339,6 +1376,11 @@ def collect_action_statistics(
         )
 
     frame = load_evaluation_outputs(normalized_inputs)
+    normalized_expected_seeds = (
+        None
+        if expected_seeds is None
+        else validate_expected_seed_panel(frame, expected_seeds)
+    )
     per_run = compute_per_run_metrics(frame)
     run_summary = summarize_run_metrics(per_run)
     confusion_counts, confusion_rates = build_confusion_tables(frame)
@@ -1392,6 +1434,7 @@ def collect_action_statistics(
         normalized_labels,
         n_bootstrap,
         bootstrap_seed,
+        normalized_expected_seeds,
     )
     (destination / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
