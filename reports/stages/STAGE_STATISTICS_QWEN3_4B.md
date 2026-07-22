@@ -172,6 +172,22 @@ Git 仓库只保留代码、配置、测试、实验计划和本报告；大型�
 
 当前代码仓库整理完成后可位于新版 `main`，但暂停行为严格绑定旧生成 commit。恢复前必须先执行 `git switch --detach 0d38dcfcfbc89e6df181cf9d4f0110f55ddbb82c` 并确认 worktree clean；完成所有 behavior/P&P 后再切回 `main` 执行统计与 formal-stage audit。不得修改 runtime provenance 来绕过这一绑定。
 
+当前 checkpoint 的恢复命令如下。第一段只补齐行为、Probe&Prefill 和 scoped 重标；第二段回到新版代码后生成三套统计，全部完成后再按根 README 运行 formal-stage audit 与 handoff：
+
+```bash
+test -z "$(git status --porcelain)"
+test "$(git branch --show-current)" = main
+
+git switch --detach 0d38dcfcfbc89e6df181cf9d4f0110f55ddbb82c
+set -o pipefail
+git show main:scripts/run_statistics_stage.sh | STAGE_START=behavior bash
+
+git switch main
+git pull --ff-only
+test -z "$(git status --porcelain)"
+STAGE_START=statistics bash scripts/run_statistics_stage.sh
+```
+
 ## 9. 文件夹整理与旧方案清理
 
 - 旧 `experiments_2d` 数据树已在 original-W2T 可复用子集完成 destination-only SHA 校验后删除；迁移 receipt 与自包含审计源保留在当前 `probes/scoped_original_w2t/`。
