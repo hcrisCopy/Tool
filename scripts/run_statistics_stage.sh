@@ -20,6 +20,16 @@ FULL_OUTPUTS=(
   "${ROOT}/outputs/fulltools/probe_prefill_t0.7_fulltools.json"
   "${ROOT}/outputs/fulltools/probe_prefill_t0.9_fulltools.json"
 )
+FULL_SETTINGS=(
+  current_no_reasoning_fulltools
+  necessary_tool_no_reasoning_fulltools
+  sparse_tool_no_reasoning_fulltools
+  probe_prefill_t0.1_fulltools
+  probe_prefill_t0.3_fulltools
+  probe_prefill_t0.5_fulltools
+  probe_prefill_t0.7_fulltools
+  probe_prefill_t0.9_fulltools
+)
 
 SCOPED_PROMPT_NAMES=(
   force_tool_no_reasoning_scoped.json
@@ -36,9 +46,13 @@ SCOPED_PROMPT_NAMES=(
 
 SCOPED_ADAPTED_OUTPUTS=()
 SCOPED_ORIGINAL_OUTPUTS=()
+SCOPED_ADAPTED_SETTINGS=()
+SCOPED_ORIGINAL_SETTINGS=()
 for name in "${SCOPED_PROMPT_NAMES[@]}"; do
   SCOPED_ADAPTED_OUTPUTS+=("${ROOT}/outputs/scoped_adapted/${name}")
   SCOPED_ORIGINAL_OUTPUTS+=("${ROOT}/outputs/scoped_original_w2t/${name}")
+  SCOPED_ADAPTED_SETTINGS+=("${name%.json}")
+  SCOPED_ORIGINAL_SETTINGS+=("${name%.json}")
 done
 for threshold in 0.1 0.3 0.5 0.7 0.9; do
   SCOPED_ADAPTED_OUTPUTS+=(
@@ -47,6 +61,8 @@ for threshold in 0.1 0.3 0.5 0.7 0.9; do
   SCOPED_ORIGINAL_OUTPUTS+=(
     "${ROOT}/outputs/scoped_original_w2t/probe_prefill_t${threshold}_scoped_original_w2t.json"
   )
+  SCOPED_ADAPTED_SETTINGS+=("probe_prefill_t${threshold}_scoped")
+  SCOPED_ORIGINAL_SETTINGS+=("probe_prefill_t${threshold}_scoped_original_w2t")
 done
 
 ANALYSIS_ARGS=()
@@ -102,6 +118,48 @@ if [[ ! -f "${ROOT}/probes/scoped_original_w2t/migration_receipt.json" ]]; then
     --output-root "${ROOT}" \
     --transfer-mode hardlink
 fi
+
+python - "${CONFIG}" "${ROOT}" "${DATA}/tasks_v1_test_category.json" \
+  "${LABELS}/test_labels_no_reasoning_scoped_original_w2t.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from when2tool_action.config import load_config, require_inputs
+from when2tool_action.data import load_task_json
+from when2tool_action.io_utils import sha256_file
+from when2tool_action.scripts.run_probe_prefill import (
+    validate_original_protocol_files,
+    validate_original_protocol_metadata,
+)
+
+config_path, root_path, data_path, labels_path = map(Path, sys.argv[1:])
+config = load_config(config_path)
+require_inputs(config)
+root = root_path.resolve()
+probe_dir = root / "probes" / "scoped_original_w2t"
+receipt = json.loads((probe_dir / "migration_receipt.json").read_text(encoding="utf-8"))
+labels = json.loads(labels_path.read_text(encoding="utf-8"))
+tasks = load_task_json(data_path, expected_scope="scoped")
+validate_original_protocol_metadata(
+    receipt,
+    labels,
+    model_slug=config.model.slug,
+    config_sha256=sha256_file(config.source),
+    label_seed=config.generation.seeds[0],
+    task_ids=[task["id"] for task in tasks],
+    n_layers=config.model.num_hidden_layers + 1,
+    hidden_dim=config.model.hidden_size,
+    probe_c=config.probe.c,
+)
+validate_original_protocol_files(
+    receipt=receipt,
+    probe_dir=probe_dir,
+    labels_path=labels_path.resolve(),
+    run_root=config.run_root,
+)
+print("Validated existing original-W2T migration receipt and bound artifacts.")
+PY
 
 python -m when2tool_action.scripts.run_scoped_baseline \
   --config "${CONFIG}" \
@@ -162,7 +220,11 @@ python -m when2tool_action.scripts.collect_action_stats \
     "${LABELS}/train_labels_no_reasoning_fulltools.json" \
     "${LABELS}/test_labels_no_reasoning_fulltools.json" \
   --output-dir "${FULL_ANALYSIS}" \
+  --data "${DATA}/tasks_v1_test_fulltools_category.json" \
+  --runtime-provenance "${ROOT}/manifests/runtime_provenance.json" \
   --expected-seeds 0 1 2 \
+  --expected-settings "${FULL_SETTINGS[@]}" \
+  --analysis-protocol fulltools \
   "${ANALYSIS_ARGS[@]}"
 
 python -m when2tool_action.scripts.collect_action_stats \
@@ -171,7 +233,11 @@ python -m when2tool_action.scripts.collect_action_stats \
     "${LABELS}/train_labels_no_reasoning_scoped.json" \
     "${LABELS}/test_labels_no_reasoning_scoped.json" \
   --output-dir "${SCOPED_ADAPTED_ANALYSIS}" \
+  --data "${DATA}/tasks_v1_test_category.json" \
+  --runtime-provenance "${ROOT}/manifests/runtime_provenance.json" \
   --expected-seeds 0 1 2 \
+  --expected-settings "${SCOPED_ADAPTED_SETTINGS[@]}" \
+  --analysis-protocol scoped_adapted \
   "${ANALYSIS_ARGS[@]}"
 
 python -m when2tool_action.scripts.collect_action_stats \
@@ -180,5 +246,9 @@ python -m when2tool_action.scripts.collect_action_stats \
     "${LABELS}/train_labels_no_reasoning_scoped_original_w2t.json" \
     "${LABELS}/test_labels_no_reasoning_scoped_original_w2t.json" \
   --output-dir "${SCOPED_ORIGINAL_ANALYSIS}" \
+  --data "${DATA}/tasks_v1_test_category.json" \
+  --runtime-provenance "${ROOT}/manifests/runtime_provenance.json" \
   --expected-seeds 0 1 2 \
+  --expected-settings "${SCOPED_ORIGINAL_SETTINGS[@]}" \
+  --analysis-protocol scoped_original_w2t \
   "${ANALYSIS_ARGS[@]}"

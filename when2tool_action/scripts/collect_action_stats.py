@@ -25,24 +25,46 @@ def build_parser() -> argparse.ArgumentParser:
         "--labels",
         type=Path,
         nargs="+",
-        default=None,
+        required=True,
         help=(
-            "Optional strict hard-no-tool label artifacts, typically train then "
+            "Strict hard-no-tool label artifacts, typically train then "
             "test, for split-preserving difficulty/category/necessity counts."
         ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--data",
+        type=Path,
+        required=True,
+        help="Exact behavior task JSON whose SHA256 is recorded by every artifact.",
+    )
+    parser.add_argument(
+        "--runtime-provenance",
+        type=Path,
+        required=True,
+        help="Registered runtime_provenance.json referenced by behavior artifacts.",
+    )
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260722)
     parser.add_argument(
         "--expected-seeds",
         type=int,
         nargs="+",
-        default=None,
+        required=True,
         help=(
-            "Require every setting to contain exactly this seed panel. "
-            "Omit for intentionally partial smoke analysis."
+            "Require every setting to contain exactly this formal seed panel."
         ),
+    )
+    parser.add_argument(
+        "--expected-settings",
+        nargs="+",
+        required=True,
+        help="Require the exact formal setting panel, with no missing or extra setting.",
+    )
+    parser.add_argument(
+        "--analysis-protocol",
+        choices=["fulltools", "scoped_adapted", "scoped_original_w2t"],
+        required=True,
     )
     parser.add_argument(
         "--overwrite",
@@ -62,6 +84,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_bootstrap=args.bootstrap_samples,
         bootstrap_seed=args.bootstrap_seed,
         expected_seeds=args.expected_seeds,
+        expected_settings=args.expected_settings,
+        analysis_protocol=args.analysis_protocol,
+        data_path=args.data,
+        runtime_provenance_path=args.runtime_provenance,
     )
     print(
         json.dumps(

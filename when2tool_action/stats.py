@@ -20,6 +20,12 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -33,10 +39,11 @@ import pandas as pd
 import seaborn as sns
 from sklearn.metrics import f1_score
 
+from .constants import DIFFICULTIES
 from .constants import SCHEMA_VERSION as ACTION_SCHEMA_VERSION
 from .constants import UPSTREAM_COMMIT
 from .evaluation_contract import validate_action_row
-from .io_utils import sha256_file
+from .io_utils import canonical_json_sha256, sha256_file
 
 
 ACTIONS = ("NONE", "A", "B", "C")
@@ -79,6 +86,29 @@ BOOTSTRAP_METRICS = (
     "overcall_rate",
 )
 SCHEMA_VERSION = "when2tool_action_stats.v3"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ANALYSIS_PROTOCOLS = {
+    "fulltools": ("full", "adapted"),
+    "scoped_adapted": ("scoped", "adapted"),
+    "scoped_original_w2t": ("scoped", "scoped_original_w2t"),
+}
+
+
+@dataclass(frozen=True)
+class EvaluationInputMetadata:
+    path: Path
+    sha256: str
+    model: str
+    tool_scope: str
+    setting: str
+    seeds: tuple[int, ...]
+    config_sha256: str
+    data_sha256: str
+    labels_sha256: str
+    runtime_provenance_sha256: str
+    project_git_commit: str
+    task_ids_sha256: str
+    full_menu_sha256: str
 
 METRIC_DEFINITIONS = {
     "final_accuracy": "Fraction of tasks whose final answer is correct.",
@@ -98,16 +128,29 @@ METRIC_DEFINITIONS = {
     "no_call_recall": "P(predicted NONE | gold NONE); equivalently recall_NONE.",
     "under_call_rate": "Among gold A/B/C tasks, fraction with zero calls.",
     "category_accuracy_needed_given_call": (
-        "Among gold A/B/C tasks whose first prediction is a valid called category "
-        "A/B/C, fraction whose predicted category equals the gold category."
+        "Among gold A/B/C tasks with at least one routed call, including INVALID "
+        "attempts, fraction whose first predicted category equals the gold category."
+    ),
+    "category_accuracy_needed_given_valid_call": (
+        "Diagnostic restricted to gold A/B/C tasks whose first prediction is a "
+        "valid A/B/C category; INVALID attempts are excluded from this denominator."
     ),
     "wrong_category_rate": "Among gold A/B/C tasks, fraction whose first call is another valid category.",
     "invalid_tool_rate": "Fraction of tasks with an INVALID category anywhere in the routed call sequence.",
-    "mixed_call_rate": "Fraction of all tasks whose routed call sequence contains more than one category.",
+    "mixed_call_rate": (
+        "Primary mixed-category rate: fraction of tasks whose routed call sequence "
+        "contains at least two distinct valid A/B/C categories."
+    ),
+    "mixed_call_rate_including_invalid": (
+        "Diagnostic mixed-category rate counting INVALID as an additional category."
+    ),
     "multi_call_rate": "Fraction of tasks with more than one executed/routed tool call.",
     "mixed_over_multicall_rate": (
         "Among tasks with more than one call, fraction whose routed category sequence "
-        "contains more than one distinct category."
+        "contains at least two distinct valid A/B/C categories."
+    ),
+    "mixed_over_multicall_rate_including_invalid": (
+        "Diagnostic multi-call mixed rate that counts INVALID as an additional category."
     ),
     "majority_accuracy_baseline": "Accuracy of always predicting the most frequent gold action in that run.",
     "prior_matched_expected_accuracy": "Expected accuracy of sampling predictions from the empirical gold prior, sum_c p(c)^2.",
@@ -134,6 +177,14 @@ TABLE_DEFINITIONS = {
     "multicall_by_gold.csv": (
         "The multicall summary split by gold NONE/A/B/C, including top "
         "mixed-category sequence counts."
+    ),
+    "difficulty_metric_summary.csv": (
+        "Per-difficulty behavior metrics aggregated over the registered seed panel "
+        "as arithmetic mean and population SD."
+    ),
+    "difficulty_current_relative_tradeoff_summary.csv": (
+        "Per-difficulty current-relative tool-call and final-accuracy tradeoffs, "
+        "paired by seed and aggregated as mean and population SD."
     ),
     "run_diagnostics.csv": (
         "One row per setting/run with mutually exclusive termination counts, "
@@ -212,6 +263,161 @@ def _run_objects(payload: Any, path: Path) -> list[Mapping[str, Any]]:
             f"{path}: expected a top-level 'runs' list or one run object; missing {missing}"
         )
     return [root]
+
+
+def _require_sha256(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+        raise ValueError(f"{context} must be a lowercase SHA256 digest")
+    return value
+
+
+def _validate_formal_artifact_metadata(
+    payload: Any,
+    path: Path,
+    runs: Sequence[Mapping[str, Any]],
+) -> EvaluationInputMetadata:
+    root = _require_mapping(payload, f"Top level of {path}")
+    required_top = {"schema_version", "upstream_commit", "config", "runs"}
+    allowed_top = {*required_top, "derivation"}
+    if set(root) != required_top and set(root) != allowed_top:
+        raise ValueError(
+            f"{path}: formal artifact top-level keys must be exactly {required_top} "
+            f"with optional derivation; got {set(root)}"
+        )
+    if root["schema_version"] != ACTION_SCHEMA_VERSION:
+        raise ValueError(f"{path}: behavior schema_version mismatch")
+    if root["upstream_commit"] != UPSTREAM_COMMIT:
+        raise ValueError(f"{path}: upstream_commit mismatch")
+    config = _require_mapping(root["config"], f"{path}.config")
+    required_config = {
+        "model",
+        "config_sha256",
+        "data_sha256",
+        "labels_sha256",
+        "runtime_provenance_sha256",
+        "project_git_commit",
+        "setting",
+        "tool_scope",
+        "seeds",
+        "full_menu_sha256",
+        "task_ids_sha256",
+        "smoke",
+    }
+    missing = sorted(required_config - set(config))
+    if missing:
+        raise ValueError(f"{path}: formal artifact config is missing {missing}")
+    model = _require_nonempty_string(config["model"], f"{path}.config.model")
+    setting = _require_nonempty_string(config["setting"], f"{path}.config.setting")
+    tool_scope = _require_nonempty_string(
+        config["tool_scope"], f"{path}.config.tool_scope"
+    )
+    if tool_scope not in {"full", "scoped"}:
+        raise ValueError(f"{path}: unsupported tool_scope {tool_scope!r}")
+    raw_seeds = config["seeds"]
+    if not isinstance(raw_seeds, list) or not raw_seeds:
+        raise TypeError(f"{path}.config.seeds must be a non-empty list")
+    seeds = tuple(
+        _require_int(seed, f"{path}.config.seeds[{index}]")
+        for index, seed in enumerate(raw_seeds)
+    )
+    if len(seeds) != len(set(seeds)):
+        raise ValueError(f"{path}.config.seeds must be unique")
+    if config["smoke"] is not False:
+        raise ValueError(f"{path}: formal statistics reject smoke artifacts")
+    if len(runs) != len(seeds):
+        raise ValueError(
+            f"{path}: expected {len(seeds)} complete runs from config.seeds, "
+            f"got {len(runs)}"
+        )
+
+    reference_ids: list[Any] | None = None
+    for run_index, (run, seed) in enumerate(zip(runs, seeds)):
+        if run.get("seed") != seed:
+            raise ValueError(
+                f"{path} runs[{run_index}].seed={run.get('seed')!r}, expected {seed}"
+            )
+        expected_run_id = f"run_{run_index}_seed_{seed}"
+        if run.get("run_id") != expected_run_id:
+            raise ValueError(
+                f"{path} runs[{run_index}].run_id={run.get('run_id')!r}, "
+                f"expected {expected_run_id!r}"
+            )
+        if run.get("setting") != setting:
+            raise ValueError(f"{path} runs[{run_index}].setting disagrees with config")
+        rows = run.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(f"{path} runs[{run_index}].rows must be non-empty")
+        ids: list[Any] = []
+        for row_index, raw_row in enumerate(rows):
+            row = _require_mapping(raw_row, f"{path} runs[{run_index}].rows[{row_index}]")
+            if row.get("schema_version") != ACTION_SCHEMA_VERSION:
+                raise ValueError(
+                    f"{path} runs[{run_index}].rows[{row_index}].schema_version mismatch"
+                )
+            if row.get("tool_scope") != tool_scope:
+                raise ValueError(
+                    f"{path} runs[{run_index}].rows[{row_index}].tool_scope mismatch"
+                )
+            if row.get("category") not in TOOL_ACTIONS:
+                raise ValueError(
+                    f"{path} runs[{run_index}].rows[{row_index}].category is invalid"
+                )
+            difficulty = _require_nonempty_string(
+                row.get("difficulty"),
+                f"{path} runs[{run_index}].rows[{row_index}].difficulty",
+            )
+            if difficulty not in DIFFICULTIES:
+                raise ValueError(
+                    f"{path} runs[{run_index}].rows[{row_index}].difficulty "
+                    f"is invalid: {difficulty!r}"
+                )
+            ids.append(
+                _require_int(
+                    row.get("id"),
+                    f"{path} runs[{run_index}].rows[{row_index}].id",
+                )
+            )
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"{path} runs[{run_index}] contains duplicate task IDs")
+        if reference_ids is None:
+            reference_ids = ids
+        elif ids != reference_ids:
+            raise ValueError(f"{path}: formal runs must preserve task ID order")
+    assert reference_ids is not None
+    task_ids_sha256 = _require_sha256(
+        config["task_ids_sha256"], f"{path}.config.task_ids_sha256"
+    )
+    if canonical_json_sha256(reference_ids) != task_ids_sha256:
+        raise ValueError(f"{path}: config.task_ids_sha256 disagrees with run rows")
+
+    return EvaluationInputMetadata(
+        path=path.resolve(),
+        sha256=sha256_file(path),
+        model=model,
+        tool_scope=tool_scope,
+        setting=setting,
+        seeds=seeds,
+        config_sha256=_require_sha256(
+            config["config_sha256"], f"{path}.config.config_sha256"
+        ),
+        data_sha256=_require_sha256(
+            config["data_sha256"], f"{path}.config.data_sha256"
+        ),
+        labels_sha256=_require_sha256(
+            config["labels_sha256"], f"{path}.config.labels_sha256"
+        ),
+        runtime_provenance_sha256=_require_sha256(
+            config["runtime_provenance_sha256"],
+            f"{path}.config.runtime_provenance_sha256",
+        ),
+        project_git_commit=_require_nonempty_string(
+            config["project_git_commit"], f"{path}.config.project_git_commit"
+        ),
+        task_ids_sha256=task_ids_sha256,
+        full_menu_sha256=_require_sha256(
+            config["full_menu_sha256"], f"{path}.config.full_menu_sha256"
+        ),
+    )
 
 
 def _optional_event_boolean(
@@ -298,6 +504,14 @@ def _derive_row(
         )
 
     task_id = _canonical_identifier(row["id"], f"{context}.id")
+    if "difficulty" not in row:
+        raise ValueError(f"{context} is missing required field difficulty")
+    difficulty = _require_nonempty_string(row["difficulty"], f"{context}.difficulty")
+    if difficulty not in DIFFICULTIES:
+        raise ValueError(f"{context}.difficulty is invalid: {difficulty!r}")
+    task_category = row.get("category")
+    if task_category is not None and task_category not in TOOL_ACTIONS:
+        raise ValueError(f"{context}.category is invalid: {task_category!r}")
     contract = validate_action_row(
         row,
         context=context,
@@ -313,7 +527,11 @@ def _derive_row(
     pred_action = contract.pred_action
     has_invalid_tool = contract.invalid_tool_calls > 0
     unique_categories = list(contract.unique_categories)
-    mixed_calls = contract.mixed_category_calls
+    valid_category_sequence = [
+        category for category in category_sequence if category in TOOL_ACTIONS
+    ]
+    mixed_calls = len(set(valid_category_sequence)) >= 2
+    mixed_calls_including_invalid = contract.mixed_category_calls
     outcome = contract.outcome
     termination_reason = _require_nonempty_string(
         row["termination_reason"], f"{context}.termination_reason"
@@ -343,6 +561,8 @@ def _derive_row(
     result: dict[str, Any] = {
         "source_file": str(source_path),
         "id": task_id,
+        "difficulty": difficulty,
+        "task_category": task_category,
         "run_id": run_id,
         "seed": seed,
         "setting": setting,
@@ -359,8 +579,13 @@ def _derive_row(
         "category_sequence_text": ">".join(category_sequence)
         if category_sequence
         else "NONE",
+        "valid_category_sequence_text": ">".join(valid_category_sequence)
+        if valid_category_sequence
+        else "NONE",
         "mixed_calls": mixed_calls,
         "mixed_category_calls": mixed_calls,
+        "mixed_calls_including_invalid": mixed_calls_including_invalid,
+        "mixed_category_calls_including_invalid": mixed_calls_including_invalid,
         "has_invalid_tool": has_invalid_tool,
         "termination_reason": termination_reason,
         "tool_parse_failures": tool_parse_failures,
@@ -376,16 +601,20 @@ def _derive_row(
     return result
 
 
-def load_evaluation_outputs(paths: Sequence[Path | str]) -> pd.DataFrame:
-    """Load, validate and derive action records from one or more JSON files."""
-
+def _load_evaluation_outputs_and_metadata(
+    paths: Sequence[Path | str], *, require_formal_protocol: bool
+) -> tuple[pd.DataFrame, list[EvaluationInputMetadata]]:
     if not paths:
         raise ValueError("At least one evaluation output path is required")
     records: list[dict[str, Any]] = []
+    metadata: list[EvaluationInputMetadata] = []
     for raw_path in paths:
-        path = Path(raw_path)
+        path = Path(raw_path).resolve()
         payload = _read_json(path)
-        for run_index, run in enumerate(_run_objects(payload, path)):
+        runs = _run_objects(payload, path)
+        if require_formal_protocol:
+            metadata.append(_validate_formal_artifact_metadata(payload, path, runs))
+        for run_index, run in enumerate(runs):
             for field in ("run_id", "seed", "setting", "rows"):
                 if field not in run:
                     raise ValueError(f"{path} runs[{run_index}] is missing {field!r}")
@@ -404,9 +633,24 @@ def load_evaluation_outputs(paths: Sequence[Path | str]) -> pd.DataFrame:
     _validate_evaluation_frame(frame)
     for field in OPTIONAL_BOOLEAN_FIELDS:
         frame[field] = frame[field].astype("boolean")
-    return frame.sort_values(["setting", "run_id", "id"], kind="stable").reset_index(
-        drop=True
+    frame = frame.sort_values(
+        ["setting", "run_id", "id"], kind="stable"
+    ).reset_index(drop=True)
+    return frame, metadata
+
+
+def load_evaluation_outputs(paths: Sequence[Path | str]) -> pd.DataFrame:
+    """Load, validate and derive action records from one or more JSON files.
+
+    This public low-level loader retains support for compact diagnostic fixtures.
+    The formal :func:`collect_action_statistics` entry point additionally requires
+    and cross-validates the complete persisted protocol metadata.
+    """
+
+    frame, _ = _load_evaluation_outputs_and_metadata(
+        paths, require_formal_protocol=False
     )
+    return frame
 
 
 def _validate_evaluation_frame(frame: pd.DataFrame) -> None:
@@ -481,6 +725,129 @@ def validate_expected_seed_panel(
     return tuple(normalized)
 
 
+def _validate_formal_input_panel(
+    frame: pd.DataFrame,
+    metadata: Sequence[EvaluationInputMetadata],
+    *,
+    expected_settings: Sequence[str],
+    expected_seeds: Sequence[int],
+) -> tuple[tuple[str, ...], tuple[int, ...], EvaluationInputMetadata]:
+    settings: list[str] = []
+    for index, value in enumerate(expected_settings):
+        settings.append(
+            _require_nonempty_string(value, f"expected_settings[{index}]")
+        )
+    if not settings or len(settings) != len(set(settings)):
+        raise ValueError("expected_settings must be non-empty and unique")
+    actual_settings = set(str(value) for value in frame["setting"].unique())
+    expected_setting_set = set(settings)
+    if actual_settings != expected_setting_set:
+        raise ValueError(
+            "Formal setting panel mismatch: "
+            f"missing={sorted(expected_setting_set - actual_settings)}, "
+            f"extra={sorted(actual_settings - expected_setting_set)}"
+        )
+    if len(metadata) != len(settings):
+        raise ValueError(
+            f"Formal statistics require one artifact per setting; got "
+            f"{len(metadata)} artifacts for {len(settings)} settings"
+        )
+    artifact_settings = [item.setting for item in metadata]
+    if len(artifact_settings) != len(set(artifact_settings)):
+        raise ValueError("Formal behavior inputs contain duplicate artifact settings")
+    if set(artifact_settings) != expected_setting_set:
+        raise ValueError("Artifact config.setting panel differs from expected settings")
+
+    normalized_seeds = validate_expected_seed_panel(frame, expected_seeds)
+    common_fields = (
+        "model",
+        "tool_scope",
+        "config_sha256",
+        "data_sha256",
+        "labels_sha256",
+        "runtime_provenance_sha256",
+        "project_git_commit",
+        "task_ids_sha256",
+        "full_menu_sha256",
+    )
+    reference = metadata[0]
+    for item in metadata:
+        if item.seeds != normalized_seeds:
+            raise ValueError(
+                f"{item.path}: config.seeds={item.seeds!r}, expected "
+                f"{normalized_seeds!r}"
+            )
+        for field in common_fields:
+            if getattr(item, field) != getattr(reference, field):
+                raise ValueError(
+                    f"Formal behavior artifacts disagree on {field}: "
+                    f"{getattr(reference, field)!r} != {getattr(item, field)!r}"
+                )
+    return tuple(settings), normalized_seeds, reference
+
+
+def _validate_referenced_inputs(
+    behavior: EvaluationInputMetadata,
+    *,
+    data_path: Path,
+    runtime_provenance_path: Path,
+) -> dict[str, dict[str, str]]:
+    data_path = data_path.resolve()
+    runtime_provenance_path = runtime_provenance_path.resolve()
+    for path, context in (
+        (data_path, "behavior data"),
+        (runtime_provenance_path, "runtime provenance"),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing referenced {context}: {path}")
+    data_sha256 = sha256_file(data_path)
+    if data_sha256 != behavior.data_sha256:
+        raise ValueError(
+            f"Behavior data SHA256 {data_sha256} disagrees with artifact config "
+            f"{behavior.data_sha256}"
+        )
+    provenance_sha256 = sha256_file(runtime_provenance_path)
+    if provenance_sha256 != behavior.runtime_provenance_sha256:
+        raise ValueError(
+            f"Runtime provenance SHA256 {provenance_sha256} disagrees with artifact "
+            f"config {behavior.runtime_provenance_sha256}"
+        )
+    provenance = _require_mapping(
+        _read_json(runtime_provenance_path),
+        f"Top level of {runtime_provenance_path}",
+    )
+    if provenance.get("manifest_type") != "runtime-and-input-provenance":
+        raise ValueError("Runtime provenance manifest_type mismatch")
+    git = _require_mapping(
+        provenance.get("git"), f"{runtime_provenance_path}.git"
+    )
+    if git.get("commit") != behavior.project_git_commit:
+        raise ValueError(
+            "Runtime provenance git.commit disagrees with behavior generation commit"
+        )
+    return {
+        "data": {"path": str(data_path), "sha256": data_sha256},
+        "runtime_provenance": {
+            "path": str(runtime_provenance_path),
+            "sha256": provenance_sha256,
+        },
+    }
+
+
+def _statistics_code_git_commit() -> str:
+    repository = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return _require_nonempty_string(
+        result.stdout.strip(), "statistics code git commit"
+    )
+
+
 def _safe_rate(numerator: int | float, denominator: int, context: str) -> float:
     if denominator == 0:
         return math.nan
@@ -513,6 +880,7 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
     pred_need = pred != "NONE"
     gold_none = ~gold_need
     pred_none = ~pred_need
+    needed_with_call = gold_need & (group["tool_calls"].to_numpy(dtype=int) > 0)
     needed_with_valid_call = gold_need & np.isin(pred, TOOL_ACTIONS)
     multi_call = group["tool_calls"].to_numpy(dtype=int) > 1
     total_tool_calls = int(group["tool_calls"].sum())
@@ -545,7 +913,16 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
         "under_call_rate": _safe_rate(
             np.sum(pred[gold_need] == "NONE"), int(gold_need.sum()), "under-call"
         ),
+        "category_accuracy_needed_given_call_n": int(needed_with_call.sum()),
         "category_accuracy_needed_given_call": _safe_rate(
+            np.sum(pred[needed_with_call] == gold[needed_with_call]),
+            int(needed_with_call.sum()),
+            "needed category accuracy given any routed call",
+        ),
+        "category_accuracy_needed_given_valid_call_n": int(
+            needed_with_valid_call.sum()
+        ),
+        "category_accuracy_needed_given_valid_call": _safe_rate(
             np.sum(pred[needed_with_valid_call] == gold[needed_with_valid_call]),
             int(needed_with_valid_call.sum()),
             "needed category accuracy given a valid call",
@@ -560,11 +937,22 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
         ),
         "invalid_tool_rate": float(group["has_invalid_tool"].mean()),
         "mixed_call_rate": float(group["mixed_calls"].mean()),
+        "mixed_call_rate_including_invalid": float(
+            group["mixed_calls_including_invalid"].mean()
+        ),
         "multi_call_rate": float(multi_call.mean()),
         "mixed_over_multicall_rate": _safe_rate(
             np.sum(group["mixed_calls"].to_numpy(dtype=bool) & multi_call),
             int(multi_call.sum()),
             "mixed over multi-call",
+        ),
+        "mixed_over_multicall_rate_including_invalid": _safe_rate(
+            np.sum(
+                group["mixed_calls_including_invalid"].to_numpy(dtype=bool)
+                & multi_call
+            ),
+            int(multi_call.sum()),
+            "mixed including INVALID over multi-call",
         ),
         "majority_accuracy_baseline": float(prior.max()),
         "prior_matched_expected_accuracy": float(np.square(prior.to_numpy()).sum()),
@@ -611,6 +999,24 @@ def compute_per_run_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     return (
         pd.DataFrame(rows)
         .sort_values(["setting", "run_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def compute_per_difficulty_metrics(frame: pd.DataFrame) -> pd.DataFrame:
+    """Compute the registered behavior metrics separately for each difficulty."""
+
+    _validate_evaluation_frame(frame)
+    rows: list[dict[str, Any]] = []
+    for (_, _, difficulty), group in frame.groupby(
+        ["setting", "run_id", "difficulty"], sort=True
+    ):
+        row = _per_run_metric_row(group)
+        row["difficulty"] = difficulty
+        rows.append(row)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["difficulty", "setting", "run_id"], kind="stable")
         .reset_index(drop=True)
     )
 
@@ -834,7 +1240,10 @@ def _multicall_group_summary(group: pd.DataFrame) -> dict[str, Any]:
     any_call = tool_calls > 0
     multi_call = tool_calls > 1
     mixed_multicall = multi_call & group["mixed_calls"].to_numpy(dtype=bool)
-    mixed_sequences = group.loc[mixed_multicall, "category_sequence_text"]
+    mixed_multicall_including_invalid = (
+        multi_call & group["mixed_calls_including_invalid"].to_numpy(dtype=bool)
+    )
+    mixed_sequences = group.loc[mixed_multicall, "valid_category_sequence_text"]
     sequence_counts = sorted(
         (
             (str(sequence).replace(">", "->"), int(count))
@@ -883,6 +1292,22 @@ def _multicall_group_summary(group: pd.DataFrame) -> dict[str, Any]:
             int(mixed_multicall.sum()),
             int(multi_call.sum()),
             "mixed over multi-call",
+        ),
+        "mixed_multicall_including_invalid_count": int(
+            mixed_multicall_including_invalid.sum()
+        ),
+        "mixed_category_including_invalid_task_count": int(
+            mixed_multicall_including_invalid.sum()
+        ),
+        "mixed_including_invalid_over_all_rate": _safe_rate(
+            int(mixed_multicall_including_invalid.sum()),
+            n_tasks,
+            "mixed including INVALID over all tasks",
+        ),
+        "mixed_including_invalid_over_multicall_rate": _safe_rate(
+            int(mixed_multicall_including_invalid.sum()),
+            int(multi_call.sum()),
+            "mixed including INVALID over multi-call",
         ),
         "top_category_sequences_json": json.dumps(
             top_sequences, ensure_ascii=False, separators=(",", ":")
@@ -958,6 +1383,24 @@ def _tidy_group_summary(
                 }
             )
     return pd.DataFrame(rows)
+
+
+def summarize_core_run_table(
+    frame: pd.DataFrame, *, group_columns: list[str]
+) -> pd.DataFrame:
+    """Aggregate every numeric core-table field over runs as mean and SD."""
+
+    excluded = {*group_columns, "run_id", "seed"}
+    metric_columns = [
+        column
+        for column in frame.columns
+        if column not in excluded and pd.api.types.is_numeric_dtype(frame[column])
+    ]
+    return _tidy_group_summary(
+        frame,
+        group_columns=group_columns,
+        metric_columns=metric_columns,
+    )
 
 
 def build_run_diagnostics(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1132,6 +1575,37 @@ def build_current_relative_tradeoff(
         ],
     )
     return per_run_tradeoff, summary
+
+
+def build_difficulty_current_relative_tradeoff(
+    per_difficulty: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build seed-paired current-relative tradeoffs within each difficulty."""
+
+    rows: list[pd.DataFrame] = []
+    for difficulty, group in per_difficulty.groupby("difficulty", sort=True):
+        tradeoff, _ = build_current_relative_tradeoff(
+            group.drop(columns=["difficulty"])
+        )
+        tradeoff.insert(0, "difficulty", difficulty)
+        rows.append(tradeoff)
+    per_run = pd.concat(rows, ignore_index=True)
+    summary = _tidy_group_summary(
+        per_run,
+        group_columns=[
+            "difficulty",
+            "setting",
+            "reference_setting",
+            "comparison_group",
+        ],
+        metric_columns=[
+            "tool_calls_saved",
+            "tc_reduction",
+            "accuracy_loss",
+            "cost_per_saved_call",
+        ],
+    )
+    return per_run, summary
 
 
 def paired_bootstrap_comparisons(
@@ -1449,6 +1923,7 @@ def _load_strict_label_artifact(path: Path) -> tuple[dict[str, Any], list[dict[s
         "difficulty",
         "category",
         "tool_necessary",
+        "no_tool_correct",
         "gold_action",
         "seed",
         "prompt_mode",
@@ -1478,6 +1953,10 @@ def _load_strict_label_artifact(path: Path) -> tuple[dict[str, Any], list[dict[s
         difficulty = _require_nonempty_string(
             row["difficulty"], f"{path} rows[{index}].difficulty"
         )
+        if difficulty not in DIFFICULTIES:
+            raise ValueError(
+                f"{path} rows[{index}].difficulty is invalid: {difficulty!r}"
+            )
         category = row["category"]
         if category not in TOOL_ACTIONS:
             raise ValueError(
@@ -1494,6 +1973,25 @@ def _load_strict_label_artifact(path: Path) -> tuple[dict[str, Any], list[dict[s
                 f"{path} rows[{index}].gold_action={row['gold_action']!r}; "
                 f"expected {expected_action!r}"
             )
+        no_tool_correct = row["no_tool_correct"]
+        if (
+            isinstance(no_tool_correct, bool)
+            or not isinstance(no_tool_correct, int)
+            or no_tool_correct not in (0, 1)
+        ):
+            raise TypeError(
+                f"{path} rows[{index}].no_tool_correct must be integer 0 or 1"
+            )
+        if no_tool_correct != 1 - necessary:
+            raise ValueError(
+                f"{path} rows[{index}].no_tool_correct disagrees with tool_necessary"
+            )
+        protocol_id = payload.get("protocol_id")
+        if protocol_id is not None and row.get("label_protocol") != protocol_id:
+            raise ValueError(
+                f"{path} rows[{index}].label_protocol={row.get('label_protocol')!r}, "
+                f"expected {protocol_id!r}"
+            )
         rows.append(
             {
                 "source_file": str(path),
@@ -1502,9 +2000,13 @@ def _load_strict_label_artifact(path: Path) -> tuple[dict[str, Any], list[dict[s
                 "difficulty": difficulty,
                 "category": category,
                 "tool_necessary": necessary,
+                "no_tool_correct": no_tool_correct,
+                "gold_action": expected_action,
             }
         )
     metadata = {
+        "path": path.resolve(),
+        "sha256": sha256_file(path),
         "schema_version": payload["schema_version"],
         "upstream_commit": payload["upstream_commit"],
         "model": model,
@@ -1518,9 +2020,9 @@ def _load_strict_label_artifact(path: Path) -> tuple[dict[str, Any], list[dict[s
     return metadata, rows
 
 
-def load_label_distributions(paths: Sequence[Path | str]) -> pd.DataFrame:
-    """Combine strict split artifacts and retain split in every output cell."""
-
+def _load_label_artifact_panel(
+    paths: Sequence[Path | str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not paths:
         raise ValueError("At least one strict label artifact is required")
     metadata: list[dict[str, Any]] = []
@@ -1552,10 +2054,23 @@ def load_label_distributions(paths: Sequence[Path | str]) -> pd.DataFrame:
                     f"Label artifacts disagree on {key}: "
                     f"{reference[key]!r} != {item[key]!r}"
                 )
+    return metadata, rows
+
+
+def load_label_distributions(paths: Sequence[Path | str]) -> pd.DataFrame:
+    """Combine strict split artifacts and retain split in every output cell."""
+
+    _, rows = _load_label_artifact_panel(paths)
     frame = pd.DataFrame(rows)
     if frame.duplicated(["split", "id"]).any():
         raise ValueError("Combined label artifacts contain duplicate (split, id)")
-    group_columns = ["split", "difficulty", "category", "tool_necessary"]
+    group_columns = [
+        "split",
+        "difficulty",
+        "category",
+        "tool_necessary",
+        "no_tool_correct",
+    ]
     counts = (
         frame.groupby(group_columns, sort=True).size().rename("count").reset_index()
     )
@@ -1570,6 +2085,88 @@ def load_label_distribution(path: Path | str) -> pd.DataFrame:
     """Backward-compatible strict single-artifact entry point."""
 
     return load_label_distributions([path])
+
+
+def _validate_test_label_binding(
+    frame: pd.DataFrame,
+    *,
+    label_metadata: Sequence[Mapping[str, Any]],
+    label_rows: Sequence[Mapping[str, Any]],
+    behavior: EvaluationInputMetadata,
+) -> str:
+    tests = [item for item in label_metadata if item["split"] == "test"]
+    if len(tests) != 1:
+        raise ValueError(
+            f"Formal statistics require exactly one test label artifact, got {len(tests)}"
+        )
+    test = tests[0]
+    for field, expected in {
+        "model": behavior.model,
+        "tool_scope": behavior.tool_scope,
+        "sha256": behavior.labels_sha256,
+    }.items():
+        if test[field] != expected:
+            raise ValueError(
+                f"Test labels {field}={test[field]!r} disagree with behavior "
+                f"{expected!r}"
+            )
+    test_rows = [row for row in label_rows if row["split"] == "test"]
+    labels_by_id = {str(row["id"]): row for row in test_rows}
+    evaluation_ids = set(str(value) for value in frame["id"].unique())
+    if set(labels_by_id) != evaluation_ids:
+        raise ValueError(
+            "Test labels and behavior task ID sets differ: "
+            f"missing={sorted(evaluation_ids - set(labels_by_id))[:10]}, "
+            f"extra={sorted(set(labels_by_id) - evaluation_ids)[:10]}"
+        )
+    for task_id, group in frame.groupby("id", sort=True):
+        label = labels_by_id[str(task_id)]
+        gold_values = set(group["gold_action"])
+        if gold_values != {label["gold_action"]}:
+            raise ValueError(
+                f"Behavior task {task_id} gold_action values {sorted(gold_values)} "
+                f"disagree with test labels {label['gold_action']!r}"
+            )
+        difficulty_values = set(group["difficulty"])
+        if difficulty_values != {label["difficulty"]}:
+            raise ValueError(
+                f"Behavior task {task_id} difficulty values "
+                f"{sorted(difficulty_values)} disagree with test labels "
+                f"{label['difficulty']!r}"
+            )
+        category_values = set(group["task_category"])
+        if category_values != {label["category"]}:
+            raise ValueError(
+                f"Behavior task {task_id} category values {sorted(category_values)} "
+                f"disagree with test labels {label['category']!r}"
+            )
+    protocol_id = test.get("protocol_id")
+    return (
+        _require_nonempty_string(protocol_id, "test labels protocol_id")
+        if protocol_id is not None
+        else "adapted"
+    )
+
+
+def _validate_analysis_protocol(
+    analysis_protocol: str,
+    *,
+    tool_scope: str,
+    label_protocol: str,
+) -> str:
+    if analysis_protocol not in ANALYSIS_PROTOCOLS:
+        raise ValueError(
+            f"analysis_protocol must be one of {sorted(ANALYSIS_PROTOCOLS)}, "
+            f"got {analysis_protocol!r}"
+        )
+    expected = ANALYSIS_PROTOCOLS[analysis_protocol]
+    actual = (tool_scope, label_protocol)
+    if actual != expected:
+        raise ValueError(
+            f"analysis_protocol {analysis_protocol!r} requires scope/labels "
+            f"{expected!r}, got {actual!r}"
+        )
+    return analysis_protocol
 
 
 def _plot_confusions(frame: pd.DataFrame, path: Path) -> None:
@@ -1701,6 +2298,56 @@ def _plot_accuracy_vs_calls(per_run: pd.DataFrame, path: Path) -> None:
     plt.close(figure)
 
 
+def _plot_accuracy_vs_calls_by_difficulty(
+    per_difficulty: pd.DataFrame, path: Path
+) -> None:
+    difficulties = sorted(str(value) for value in per_difficulty["difficulty"].unique())
+    figure, axes = plt.subplots(
+        1,
+        len(difficulties),
+        figsize=(max(7.2, 6.0 * len(difficulties)), 5.0),
+        squeeze=False,
+        constrained_layout=True,
+        sharey=True,
+    )
+    for axis, difficulty in zip(axes.flat, difficulties):
+        subset = per_difficulty[per_difficulty["difficulty"] == difficulty]
+        sns.scatterplot(
+            data=subset,
+            x="total_tool_calls",
+            y="final_accuracy",
+            hue="setting",
+            style="setting",
+            s=65,
+            ax=axis,
+            legend=axis is axes.flat[-1],
+        )
+        means = subset.groupby("setting", sort=True)[
+            ["total_tool_calls", "final_accuracy"]
+        ].mean()
+        axis.scatter(
+            means["total_tool_calls"],
+            means["final_accuracy"],
+            marker="X",
+            s=120,
+            c="black",
+            label="setting mean" if axis is axes.flat[-1] else None,
+            zorder=5,
+        )
+        axis.set_title(difficulty)
+        axis.set_ylim(0.0, 1.0)
+        axis.set_xlabel("Total executed tool calls")
+        axis.grid(alpha=0.25)
+    axes.flat[0].set_ylabel("Final-answer accuracy")
+    if axes.flat[-1].get_legend() is not None:
+        axes.flat[-1].legend(
+            bbox_to_anchor=(1.02, 1.0), loc="upper left", frameon=False
+        )
+    figure.suptitle("Accuracy-tool-call trade-off by difficulty", fontsize=13)
+    figure.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
 def _json_scalar(value: Any) -> Any:
     if value is None or value is pd.NA:
         return None
@@ -1713,16 +2360,31 @@ def _json_scalar(value: Any) -> Any:
     return value
 
 
+def _annotate_protocol(
+    table: pd.DataFrame, *, analysis_protocol: str, label_protocol: str
+) -> pd.DataFrame:
+    result = table.copy()
+    result.insert(0, "label_protocol", label_protocol)
+    result.insert(0, "analysis_protocol", analysis_protocol)
+    return result
+
+
 def _summary_payload(
     frame: pd.DataFrame,
     per_run: pd.DataFrame,
     run_summary: pd.DataFrame,
     paired: pd.DataFrame,
-    output_paths: Sequence[Path],
+    input_metadata: Sequence[EvaluationInputMetadata],
     label_paths: Sequence[Path],
     n_bootstrap: int,
     bootstrap_seed: int,
     expected_seeds: tuple[int, ...] | None,
+    expected_settings: tuple[str, ...],
+    analysis_protocol: str,
+    label_protocol: str,
+    published_files: Sequence[Mapping[str, str]],
+    referenced_inputs: Mapping[str, Mapping[str, str]],
+    statistics_code_git_commit: str,
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {}
     for setting, group in run_summary.groupby("setting", sort=True):
@@ -1738,7 +2400,27 @@ def _summary_payload(
         }
     return {
         "schema_version": SCHEMA_VERSION,
-        "input_files": [str(path) for path in output_paths],
+        "manifest_type": "action-statistics-publication-receipt",
+        "publication_complete": True,
+        "analysis_protocol": analysis_protocol,
+        "label_protocol": label_protocol,
+        "behavior_generation_git_commit": input_metadata[0].project_git_commit,
+        "statistics_code_git_commit": statistics_code_git_commit,
+        "referenced_inputs": dict(referenced_inputs),
+        "input_files": [str(item.path) for item in input_metadata],
+        "input_artifacts": [
+            {
+                "path": str(item.path),
+                "sha256": item.sha256,
+                "setting": item.setting,
+                "model": item.model,
+                "tool_scope": item.tool_scope,
+                "labels_sha256": item.labels_sha256,
+                "runtime_provenance_sha256": item.runtime_provenance_sha256,
+                "project_git_commit": item.project_git_commit,
+            }
+            for item in input_metadata
+        ],
         "labels_file": str(label_paths[0]) if len(label_paths) == 1 else None,
         "labels_files": [
             {"path": str(path), "sha256": sha256_file(path)}
@@ -1749,6 +2431,8 @@ def _summary_payload(
         "n_settings": int(frame["setting"].nunique()),
         "n_runs": int(len(per_run)),
         "expected_seeds": None if expected_seeds is None else list(expected_seeds),
+        "expected_settings": list(expected_settings),
+        "published_files": list(published_files),
         "actions": list(ACTIONS),
         "prediction_columns": list(PREDICTIONS),
         "outcome_plot_order": list(OUTCOME_ORDER),
@@ -1772,7 +2456,7 @@ def _summary_payload(
     }
 
 
-def _prepare_output_directory(output_dir: Path, overwrite: bool) -> None:
+def _preflight_output_directory(output_dir: Path, overwrite: bool) -> None:
     if output_dir.exists():
         if not output_dir.is_dir():
             raise NotADirectoryError(
@@ -1782,8 +2466,46 @@ def _prepare_output_directory(output_dir: Path, overwrite: bool) -> None:
             raise FileExistsError(
                 f"Output directory already exists: {output_dir}; pass --overwrite intentionally"
             )
-    else:
-        output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _publish_staged_directory(
+    stage_dir: Path, output_dir: Path, *, overwrite: bool
+) -> None:
+    """Atomically publish a complete sibling directory with rollback."""
+
+    backup_root: Path | None = None
+    backup_target: Path | None = None
+    moved_existing = False
+    cleanup_backup = True
+    try:
+        if output_dir.exists():
+            if not overwrite:
+                raise FileExistsError(output_dir)
+            backup_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{output_dir.name}.backup-", dir=output_dir.parent
+                )
+            )
+            backup_target = backup_root / "previous"
+            os.replace(output_dir, backup_target)
+            moved_existing = True
+        try:
+            os.replace(stage_dir, output_dir)
+        except BaseException as publish_error:
+            if moved_existing and backup_target is not None and backup_target.exists():
+                try:
+                    os.replace(backup_target, output_dir)
+                except OSError as rollback_error:
+                    cleanup_backup = False
+                    raise RuntimeError(
+                        "Statistics publication failed and rollback was incomplete; "
+                        f"backup retained at {backup_root}"
+                    ) from rollback_error
+            raise publish_error
+    finally:
+        if cleanup_backup and backup_root is not None and backup_root.exists():
+            shutil.rmtree(backup_root, ignore_errors=False)
 
 
 def collect_action_statistics(
@@ -1796,60 +2518,112 @@ def collect_action_statistics(
     n_bootstrap: int = 10000,
     bootstrap_seed: int = 20260722,
     expected_seeds: Sequence[int] | None = None,
+    expected_settings: Sequence[str] | None = None,
+    analysis_protocol: str | None = None,
+    data_path: Path | str | None = None,
+    runtime_provenance_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Validate evaluation outputs and write all statistics and plots."""
+    """Validate a formal behavior panel and transactionally publish statistics."""
 
-    normalized_inputs = [Path(path) for path in output_paths]
-    destination = Path(output_dir)
+    normalized_inputs = [Path(path).resolve() for path in output_paths]
+    destination = Path(output_dir).resolve()
     if labels_path is not None and labels_paths is not None:
         raise ValueError("Pass labels_path or labels_paths, not both")
     normalized_labels = (
-        [Path(labels_path)]
+        [Path(labels_path).resolve()]
         if labels_path is not None
-        else [Path(path) for path in labels_paths or ()]
+        else [Path(path).resolve() for path in labels_paths or ()]
     )
+    if not normalized_labels:
+        raise ValueError("Formal statistics require train/test label artifacts")
+    if expected_seeds is None:
+        raise ValueError("Formal statistics require an explicit expected seed panel")
+    if expected_settings is None:
+        raise ValueError("Formal statistics require an explicit expected setting panel")
+    if analysis_protocol is None:
+        raise ValueError("Formal statistics require an explicit analysis_protocol")
+    if data_path is None or runtime_provenance_path is None:
+        raise ValueError(
+            "Formal statistics require explicit data and runtime provenance paths"
+        )
+    normalized_data = Path(data_path).resolve()
+    normalized_provenance = Path(runtime_provenance_path).resolve()
     if destination in normalized_inputs or destination in normalized_labels:
         raise ValueError("Output directory must differ from every input path")
-    if destination.exists() and not destination.is_dir():
-        raise NotADirectoryError(
-            f"Output path exists and is not a directory: {destination}"
-        )
-    if destination.exists() and not overwrite:
-        raise FileExistsError(
-            f"Output directory already exists: {destination}; pass --overwrite intentionally"
-        )
+    _preflight_output_directory(destination, overwrite)
 
-    frame = load_evaluation_outputs(normalized_inputs)
-    normalized_expected_seeds = (
-        None
-        if expected_seeds is None
-        else validate_expected_seed_panel(frame, expected_seeds)
+    frame, input_metadata = _load_evaluation_outputs_and_metadata(
+        normalized_inputs, require_formal_protocol=True
     )
+    (
+        normalized_expected_settings,
+        normalized_expected_seeds,
+        behavior_metadata,
+    ) = _validate_formal_input_panel(
+        frame,
+        input_metadata,
+        expected_settings=expected_settings,
+        expected_seeds=expected_seeds,
+    )
+    referenced_inputs = _validate_referenced_inputs(
+        behavior_metadata,
+        data_path=normalized_data,
+        runtime_provenance_path=normalized_provenance,
+    )
+    statistics_code_git_commit = _statistics_code_git_commit()
+    label_metadata, label_rows = _load_label_artifact_panel(normalized_labels)
+    label_protocol = _validate_test_label_binding(
+        frame,
+        label_metadata=label_metadata,
+        label_rows=label_rows,
+        behavior=behavior_metadata,
+    )
+    normalized_analysis_protocol = _validate_analysis_protocol(
+        analysis_protocol,
+        tool_scope=behavior_metadata.tool_scope,
+        label_protocol=label_protocol,
+    )
+    label_distribution = load_label_distributions(normalized_labels)
+
     per_run = compute_per_run_metrics(frame)
     run_summary = summarize_run_metrics(per_run)
+    per_difficulty = compute_per_difficulty_metrics(frame)
+    difficulty_summary = summarize_core_run_table(
+        per_difficulty, group_columns=["difficulty", "setting"]
+    )
     confusion_counts, confusion_rates = build_confusion_tables(frame)
     recall_summary = build_action_recall_summary(per_run)
     error_counts, error_rates, class_error_rates = build_error_tables(frame)
     needed_category_analysis = build_needed_category_analysis(frame)
     none_analysis = build_none_analysis(frame)
     multicall_summary, multicall_by_gold = build_multicall_tables(frame)
+    needed_category_summary = summarize_core_run_table(
+        needed_category_analysis, group_columns=["setting", "gold_action"]
+    )
+    none_summary = summarize_core_run_table(
+        none_analysis, group_columns=["setting"]
+    )
+    multicall_metric_summary = summarize_core_run_table(
+        multicall_summary, group_columns=["setting"]
+    )
+    multicall_by_gold_summary = summarize_core_run_table(
+        multicall_by_gold, group_columns=["setting", "gold_action"]
+    )
     run_diagnostics, run_diagnostic_summary = build_run_diagnostics(frame)
     gold_final_per_run, gold_final_summary = build_gold_action_final_accuracy(frame)
     tradeoff_per_run, tradeoff_summary = build_current_relative_tradeoff(per_run)
+    difficulty_tradeoff_per_run, difficulty_tradeoff_summary = (
+        build_difficulty_current_relative_tradeoff(per_difficulty)
+    )
     paired = paired_bootstrap_comparisons(
         frame, n_bootstrap=n_bootstrap, bootstrap_seed=bootstrap_seed
     )
-    label_distribution = (
-        None
-        if not normalized_labels
-        else load_label_distributions(normalized_labels)
-    )
-    _prepare_output_directory(destination, overwrite)
-
-    tables = {
+    raw_tables = {
         "derived_action_rows.csv": frame,
         "per_run_metrics.csv": per_run,
         "setting_metric_summary.csv": run_summary,
+        "difficulty_per_run_metrics.csv": per_difficulty,
+        "difficulty_metric_summary.csv": difficulty_summary,
         "confusion_counts.csv": confusion_counts,
         "confusion_row_normalized.csv": confusion_rates,
         "action_recall_summary.csv": recall_summary,
@@ -1857,40 +2631,96 @@ def collect_action_statistics(
         "outcome_rates.csv": error_rates,
         "class_outcome_rates.csv": class_error_rates,
         "needed_category_analysis.csv": needed_category_analysis,
+        "needed_category_analysis_summary.csv": needed_category_summary,
         "none_analysis.csv": none_analysis,
+        "none_analysis_summary.csv": none_summary,
         "multicall_summary.csv": multicall_summary,
+        "multicall_metric_summary.csv": multicall_metric_summary,
         "multicall_by_gold.csv": multicall_by_gold,
+        "multicall_by_gold_summary.csv": multicall_by_gold_summary,
         "run_diagnostics.csv": run_diagnostics,
         "run_diagnostic_summary.csv": run_diagnostic_summary,
         "gold_action_final_accuracy_per_run.csv": gold_final_per_run,
         "gold_action_final_accuracy_summary.csv": gold_final_summary,
         "current_relative_tradeoff_per_run.csv": tradeoff_per_run,
         "current_relative_tradeoff_summary.csv": tradeoff_summary,
+        "difficulty_current_relative_tradeoff_per_run.csv": difficulty_tradeoff_per_run,
+        "difficulty_current_relative_tradeoff_summary.csv": difficulty_tradeoff_summary,
         "paired_bootstrap_comparisons.csv": paired,
+        "label_distribution.csv": label_distribution,
     }
-    if label_distribution is not None:
-        tables["label_distribution.csv"] = label_distribution
-    for filename, table in tables.items():
-        table.to_csv(destination / filename, index=False)
+    tables = {
+        filename: _annotate_protocol(
+            table,
+            analysis_protocol=normalized_analysis_protocol,
+            label_protocol=label_protocol,
+        )
+        for filename, table in raw_tables.items()
+    }
 
-    _plot_confusions(frame, destination / "confusion_heatmap.png")
-    _plot_recalls(recall_summary, destination / "recall_bars.png")
-    _plot_error_stack(error_rates, destination / "error_stacked.png")
-    _plot_accuracy_vs_calls(per_run, destination / "accuracy_vs_total_tc.png")
+    stage_dir = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent)
+    )
+    try:
+        for filename, table in tables.items():
+            table.to_csv(stage_dir / filename, index=False)
 
-    summary = _summary_payload(
-        frame,
-        per_run,
-        run_summary,
-        paired,
-        normalized_inputs,
-        normalized_labels,
-        n_bootstrap,
-        bootstrap_seed,
-        normalized_expected_seeds,
-    )
-    (destination / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return summary
+        _plot_confusions(frame, stage_dir / "confusion_heatmap.png")
+        _plot_recalls(recall_summary, stage_dir / "recall_bars.png")
+        _plot_error_stack(error_rates, stage_dir / "error_stacked.png")
+        _plot_accuracy_vs_calls(per_run, stage_dir / "accuracy_vs_total_tc.png")
+        _plot_accuracy_vs_calls_by_difficulty(
+            per_difficulty, stage_dir / "accuracy_vs_total_tc_by_difficulty.png"
+        )
+
+        for item in input_metadata:
+            if sha256_file(item.path) != item.sha256:
+                raise RuntimeError(
+                    f"Behavior input changed during statistics collection: {item.path}"
+                )
+        for item in label_metadata:
+            if sha256_file(Path(item["path"])) != item["sha256"]:
+                raise RuntimeError(
+                    f"Label input changed during statistics collection: {item['path']}"
+                )
+        if (
+            _validate_referenced_inputs(
+                behavior_metadata,
+                data_path=normalized_data,
+                runtime_provenance_path=normalized_provenance,
+            )
+            != referenced_inputs
+        ):
+            raise RuntimeError("Referenced inputs changed during statistics collection")
+
+        published_files = [
+            {"path": path.name, "sha256": sha256_file(path)}
+            for path in sorted(stage_dir.iterdir(), key=lambda item: item.name)
+            if path.is_file()
+        ]
+        summary = _summary_payload(
+            frame,
+            per_run,
+            run_summary,
+            paired,
+            input_metadata,
+            normalized_labels,
+            n_bootstrap,
+            bootstrap_seed,
+            normalized_expected_seeds,
+            normalized_expected_settings,
+            normalized_analysis_protocol,
+            label_protocol,
+            published_files,
+            referenced_inputs,
+            statistics_code_git_commit,
+        )
+        (stage_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _publish_staged_directory(stage_dir, destination, overwrite=overwrite)
+        return summary
+    finally:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=False)
