@@ -141,7 +141,8 @@ def _config() -> SimpleNamespace:
             top_k=20,
             repetition_penalty=1.0,
             max_new_tokens=2048,
-            max_rounds=12,
+            label_hidden_extraction_max_rounds=12,
+            behavior_evaluation_max_rounds=10,
             max_model_len=32768,
         ),
         probe=SimpleNamespace(temperature=2.0, thresholds=(0.1,)),
@@ -332,5 +333,5 @@ def test_template_records_generation_and_record_mode(monkeypatch) -> None:
     assert protocol["top_k"] == 20
     assert protocol["repetition_penalty"] == 1.0
     assert protocol["max_new_tokens"] == 2048
-    assert protocol["max_rounds"] == 12
+    assert protocol["max_rounds"] == 10
     assert protocol["max_model_len"] == 32768

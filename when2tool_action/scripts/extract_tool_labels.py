@@ -69,7 +69,7 @@ def main() -> None:
             setting,
             seed=seed,
             run_id=f"labels_seed_{seed}",
-            max_rounds=config.generation.max_rounds,
+            max_rounds=config.generation.label_hidden_extraction_max_rounds,
             max_model_len=config.generation.max_model_len,
         )
         labels = build_label_rows(

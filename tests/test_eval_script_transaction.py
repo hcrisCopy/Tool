@@ -21,7 +21,8 @@ def _config(tmp_path: Path) -> SimpleNamespace:
             top_k=20,
             repetition_penalty=1.0,
             max_new_tokens=64,
-            max_rounds=2,
+            label_hidden_extraction_max_rounds=12,
+            behavior_evaluation_max_rounds=2,
             max_model_len=1024,
         ),
     )
@@ -61,6 +62,7 @@ def test_overwrite_initializes_empty_checkpoint_before_model_loading(
     def fail_model_load(config):
         checkpoint = json.loads(target.read_text(encoding="utf-8"))
         assert checkpoint["runs"] == []
+        assert checkpoint["config"]["max_rounds"] == 2
         raise RuntimeError("model load failed")
 
     monkeypatch.setattr(run_eval, "build_agent", fail_model_load)
@@ -107,6 +109,7 @@ def test_scoped_matrix_finishes_all_preflights_before_initialization(
     ):
         nonlocal calls
         calls += 1
+        assert template["config"]["max_rounds"] == 2
         if calls == 2:
             raise ValueError("later target preflight failed")
         return PreparedEvaluationArtifact(path.resolve(), template, 0, True)

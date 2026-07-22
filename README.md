@@ -99,6 +99,7 @@ python -m when2tool_action.scripts.relabel_scoped_outputs \
 
 ## 关键实验契约
 
+- 交互轮数严格拆成两个无兼容回退的配置字段：`label_hidden_extraction_max_rounds: 12` 对齐 pinned `extract_features.py` 的标签/hidden extraction 协议；`behavior_evaluation_max_rounds: 10` 对齐 pinned `run_eval.py` 与 `run_probe_eval.py` 的正式 behavior/Probe&Prefill 协议。配置中不存在通用 `max_rounds`；两者缺失、互换或改值都会直接报错。hidden extraction 本身只做一次 prompt forward，12 轮指它所依赖的 hard-no-tool 标签生成协议。
 - 数据中始终只保存 gold environment；`--tool-scope full` 只在运行时创建 15 个新环境实例并注入固定 33-tool menu。
 - `ListManipulation` 格式说明按“菜单是否暴露该工具”决定：scoped 仅 List 任务加入，full-tools 则所有任务统一加入；绝不按 full-tools 的 gold environment 条件化 system message。由旧 gold 条件产生的 smoke 结果已作废并删除。
 - 全工具按 environment/name 固定排序，菜单保存 SHA256；不重命名工具，不在 prompt 泄露 A/B/C、gold env 或 gold tool。

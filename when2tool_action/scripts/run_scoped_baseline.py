@@ -110,7 +110,7 @@ def main() -> None:
                     "top_k": config.generation.top_k,
                     "repetition_penalty": config.generation.repetition_penalty,
                     "max_new_tokens": config.generation.max_new_tokens,
-                    "max_rounds": config.generation.max_rounds,
+                    "max_rounds": config.generation.behavior_evaluation_max_rounds,
                     "max_model_len": config.generation.max_model_len,
                     "full_menu_sha256": full_menu_sha256(),
                     "task_ids_sha256": task_hash,
@@ -163,7 +163,7 @@ def main() -> None:
                     setting,
                     seed=seed,
                     run_id=run_id,
-                    max_rounds=config.generation.max_rounds,
+                    max_rounds=config.generation.behavior_evaluation_max_rounds,
                     max_model_len=config.generation.max_model_len,
                 )
                 artifact["runs"].append(

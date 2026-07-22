@@ -491,7 +491,7 @@ def _validate_label_manifest(
         "single_gpu_adaptation": True,
         "enable_thinking": False,
         "max_new_tokens": config.generation.max_new_tokens,
-        "max_rounds": config.generation.max_rounds,
+        "max_rounds": config.generation.label_hidden_extraction_max_rounds,
         "temperature": config.generation.temperature,
         "top_p": config.generation.top_p,
         "top_k": config.generation.top_k,

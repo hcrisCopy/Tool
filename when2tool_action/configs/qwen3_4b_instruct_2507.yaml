@@ -16,7 +16,8 @@ generation:
   top_k: 20
   repetition_penalty: 1.0
   max_new_tokens: 2048
-  max_rounds: 12
+  label_hidden_extraction_max_rounds: 12
+  behavior_evaluation_max_rounds: 10
   max_model_len: 32768
   tensor_parallel_size: 1
   gpu_memory_utilization: 0.90

@@ -48,7 +48,8 @@ class GenerationSpec:
     top_k: int
     repetition_penalty: float
     max_new_tokens: int
-    max_rounds: int
+    label_hidden_extraction_max_rounds: int
+    behavior_evaluation_max_rounds: int
     max_model_len: int
     tensor_parallel_size: int
     gpu_memory_utilization: float
@@ -94,6 +95,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
     for name, value in (("paths", p), ("model", m), ("generation", g), ("probe", q), ("statistics", s)):
         if not isinstance(value, dict):
             raise TypeError(f"{name} must be a mapping")
+    if "max_rounds" in g:
+        raise ValueError(
+            "generation.max_rounds is forbidden; configure the label/hidden and "
+            "behavior evaluation round limits explicitly"
+        )
     seeds = tuple(int(value) for value in _require(g, "seeds", "generation"))
     if seeds != (0, 1, 2):
         raise ValueError("The registered statistics protocol requires seeds [0, 1, 2]")
@@ -120,7 +126,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
             top_k=int(_require(g, "top_k", "generation")),
             repetition_penalty=float(_require(g, "repetition_penalty", "generation")),
             max_new_tokens=int(_require(g, "max_new_tokens", "generation")),
-            max_rounds=int(_require(g, "max_rounds", "generation")),
+            label_hidden_extraction_max_rounds=int(
+                _require(g, "label_hidden_extraction_max_rounds", "generation")
+            ),
+            behavior_evaluation_max_rounds=int(
+                _require(g, "behavior_evaluation_max_rounds", "generation")
+            ),
             max_model_len=int(_require(g, "max_model_len", "generation")),
             tensor_parallel_size=int(_require(g, "tensor_parallel_size", "generation")),
             gpu_memory_utilization=float(_require(g, "gpu_memory_utilization", "generation")),
@@ -136,6 +147,14 @@ def load_config(path: str | Path) -> ExperimentConfig:
     )
     if config.generation.tensor_parallel_size != 1:
         raise ValueError("This single-GPU protocol requires tensor_parallel_size=1")
+    if config.generation.label_hidden_extraction_max_rounds != 12:
+        raise ValueError(
+            "The pinned label/hidden extraction protocol requires exactly 12 rounds"
+        )
+    if config.generation.behavior_evaluation_max_rounds != 10:
+        raise ValueError(
+            "The pinned behavior and Probe&Prefill protocol requires exactly 10 rounds"
+        )
     if not 0 < config.generation.gpu_memory_utilization < 1:
         raise ValueError("gpu_memory_utilization must be in (0,1)")
     if config.extraction_batch_size < 1:
