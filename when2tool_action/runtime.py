@@ -150,7 +150,14 @@ def _route_and_record(
             "message": f"[SAFETY_REJECTED] {validation_error}",
         }
     elif tool_name == "run_code":
-        result = run_trusted_code(arguments.get("code"), trusted_code)
+        eligible_code = (
+            trusted_code_from_tasks([state["task"]])
+            if state["task"]["gold_env_name"] == "CodeExecutorEnv"
+            else frozenset()
+        )
+        if not eligible_code <= trusted_code:
+            raise AssertionError("Per-task code allowlist is outside evaluated corpus")
+        result = run_trusted_code(arguments.get("code"), eligible_code)
     else:
         target = _find_env(state, tool_name)
         if target is None:

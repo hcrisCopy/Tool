@@ -6,7 +6,7 @@ from pathlib import Path
 
 from when2tool_action.config import load_config, require_inputs
 from when2tool_action.constants import SCHEMA_VERSION, UPSTREAM_COMMIT
-from when2tool_action.data import load_task_json
+from when2tool_action.data import load_task_json, smoke_subset
 from when2tool_action.io_utils import atomic_write_json, canonical_json_sha256
 from when2tool_action.prefill import compute_prefills
 from when2tool_action.runtime import EvaluationSetting, attach_gold_actions, evaluate
@@ -33,10 +33,13 @@ def main() -> None:
     parser.add_argument("--thresholds", nargs="*", type=float, default=None)
     parser.add_argument("--seeds", nargs="*", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
     require_inputs(config)
     tasks = load_task_json(Path(args.data).resolve(), expected_scope=args.tool_scope)
+    if args.smoke:
+        tasks = smoke_subset(tasks)
     tasks = attach_gold_actions(tasks, _labels(Path(args.labels).resolve()))
     task_ids = [task["id"] for task in tasks]
     thresholds = tuple(args.thresholds) if args.thresholds else config.probe.thresholds
@@ -49,7 +52,8 @@ def main() -> None:
         raise ValueError("Seeds must be non-empty and unique")
     output_dir = Path(args.output_dir).resolve()
     output_paths = {
-        threshold: output_dir / f"probe_prefill_t{threshold:.1f}_{'fulltools' if args.tool_scope == 'full' else 'scoped'}.json"
+        threshold: output_dir
+        / f"probe_prefill_t{threshold:.1f}_{'fulltools' if args.tool_scope == 'full' else 'scoped'}{'_smoke' if args.smoke else ''}.json"
         for threshold in thresholds
     }
     for path in output_paths.values():
@@ -86,6 +90,7 @@ def main() -> None:
                 "seeds": list(seeds),
                 "full_menu_sha256": full_menu_sha256(),
                 "task_ids_sha256": canonical_json_sha256(task_ids),
+                "smoke": args.smoke,
             },
             "runs": [],
         }

@@ -40,7 +40,7 @@ TOOL_ACTIONS = ("A", "B", "C")
 OUTCOME_ORDER = (
     "success",
     "direct_answer_wrong",
-    "answer_wrong",
+    "correct_category_wrong_answer",
     "over_call",
     "under_call",
     "wrong_category",
@@ -51,7 +51,7 @@ ERROR_HIERARCHY = (
     "over_call (gold NONE, at least one valid call)",
     "under_call (gold A/B/C, zero calls)",
     "wrong_category (gold A/B/C, first valid call has another category)",
-    "direct_answer_wrong/answer_wrong (action is correct but final answer is wrong)",
+    "direct_answer_wrong/correct_category_wrong_answer (action is correct but final answer is wrong)",
     "success",
 )
 OPTIONAL_BOOLEAN_FIELDS = (
@@ -65,22 +65,63 @@ BOOTSTRAP_METRICS = (
     "avg_tool_calls",
     "total_tool_calls_per_run",
 )
-SCHEMA_VERSION = "when2tool_action_stats.v1"
+SCHEMA_VERSION = "when2tool_action_stats.v2"
 
 METRIC_DEFINITIONS = {
     "final_accuracy": "Fraction of tasks whose final answer is correct.",
     "total_tool_calls": "Sum of executed/routed tool calls in the run.",
     "avg_tool_calls": "Mean executed/routed tool calls per task.",
+    "tool_call_rate": (
+        "Tool-call rate (TCR) for this single-hop benchmark: total executed/routed "
+        "calls divided by the number of tasks. This is a call-volume metric, not "
+        "the fraction of tasks that called, and can exceed 1 when multi-calls occur."
+    ),
     "action_accuracy": "Accuracy of the first executed tool category, with zero calls mapped to NONE.",
     "balanced_accuracy": "Unweighted mean recall over gold action classes present in the run.",
     "macro_f1": "Macro F1 over gold classes NONE/A/B/C; INVALID predictions count as misses.",
     "toolneed_f1": "Binary F1 for tool-needed (A/B/C) versus NONE; INVALID is a tool attempt.",
     "overcall_rate": "Among gold NONE tasks, fraction with one or more calls.",
+    "no_call_precision": "P(gold NONE | predicted NONE).",
+    "no_call_recall": "P(predicted NONE | gold NONE); equivalently recall_NONE.",
     "under_call_rate": "Among gold A/B/C tasks, fraction with zero calls.",
+    "category_accuracy_needed_given_call": (
+        "Among gold A/B/C tasks whose first prediction is a valid called category "
+        "A/B/C, fraction whose predicted category equals the gold category."
+    ),
     "wrong_category_rate": "Among gold A/B/C tasks, fraction whose first call is another valid category.",
     "invalid_tool_rate": "Fraction of tasks with an INVALID category anywhere in the routed call sequence.",
+    "mixed_call_rate": "Fraction of all tasks whose routed call sequence contains more than one category.",
+    "multi_call_rate": "Fraction of tasks with more than one executed/routed tool call.",
+    "mixed_over_multicall_rate": (
+        "Among tasks with more than one call, fraction whose routed category sequence "
+        "contains more than one distinct category."
+    ),
     "majority_accuracy_baseline": "Accuracy of always predicting the most frequent gold action in that run.",
     "prior_matched_expected_accuracy": "Expected accuracy of sampling predictions from the empirical gold prior, sum_c p(c)^2.",
+}
+
+TABLE_DEFINITIONS = {
+    "needed_category_analysis.csv": (
+        "One row per setting/run/gold A/B/C. call_correct_category is first "
+        "predicted action == gold; under_call is predicted NONE; wrong_category "
+        "is another valid A/B/C first action; correct_category_wrong_answer and "
+        "needed_final_success additionally split by final_correct. invalid_tool is "
+        "reported separately and can overlap when a later routed event is invalid."
+    ),
+    "none_analysis.csv": (
+        "One row per setting/run for gold NONE. Over-call A/B/C/INVALID uses the "
+        "first predicted action and therefore partitions over_call_total; "
+        "any_invalid_tool separately detects INVALID anywhere in the sequence."
+    ),
+    "multicall_summary.csv": (
+        "One row per setting/run with call-count rates. Top category sequences are "
+        "the ten most frequent mixed-category paths only, sorted by count then "
+        "lexicographically; the first three also have dedicated CSV columns."
+    ),
+    "multicall_by_gold.csv": (
+        "The multicall summary split by gold NONE/A/B/C, including top "
+        "mixed-category sequence counts."
+    ),
 }
 
 
@@ -205,7 +246,7 @@ def _classify_outcome(
         return "under_call"
     if pred_action != gold_action:
         return "wrong_category"
-    return "success" if final_correct else "answer_wrong"
+    return "success" if final_correct else "correct_category_wrong_answer"
 
 
 def _derive_row(
@@ -272,7 +313,8 @@ def _derive_row(
         category_sequence.append(category if category in TOOL_ACTIONS else "INVALID")
     pred_action = "NONE" if not category_sequence else category_sequence[0]
     has_invalid_tool = "INVALID" in category_sequence
-    mixed_calls = len(set(category_sequence)) > 1
+    unique_categories = list(dict.fromkeys(category_sequence))
+    mixed_calls = len(unique_categories) > 1
     outcome = _classify_outcome(
         gold_action, pred_action, final_correct, has_invalid_tool
     )
@@ -288,10 +330,16 @@ def _derive_row(
         "final_correct": final_correct,
         "tool_calls": tool_calls,
         "category_sequence": json.dumps(category_sequence, ensure_ascii=False),
+        "tool_call_categories": json.dumps(category_sequence, ensure_ascii=False),
+        "unique_tool_call_categories": json.dumps(
+            unique_categories, ensure_ascii=False
+        ),
+        "n_tool_call_categories": len(unique_categories),
         "category_sequence_text": ">".join(category_sequence)
         if category_sequence
         else "NONE",
         "mixed_calls": mixed_calls,
+        "mixed_category_calls": mixed_calls,
         "has_invalid_tool": has_invalid_tool,
         "outcome": outcome,
         "routed_tool_events": json.dumps(
@@ -405,6 +453,11 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
     gold_need = gold != "NONE"
     pred_need = pred != "NONE"
     gold_none = ~gold_need
+    pred_none = ~pred_need
+    needed_with_valid_call = gold_need & np.isin(pred, TOOL_ACTIONS)
+    multi_call = group["tool_calls"].to_numpy(dtype=int) > 1
+    total_tool_calls = int(group["tool_calls"].sum())
+    tool_call_rate = float(total_tool_calls / n_tasks)
     prior = pd.Series(gold).value_counts(normalize=True)
     row: dict[str, Any] = {
         "setting": setting_values[0],
@@ -412,8 +465,9 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
         "seed": int(seed_values[0]),
         "n_tasks": n_tasks,
         "final_accuracy": float(group["final_correct"].mean()),
-        "total_tool_calls": int(group["tool_calls"].sum()),
+        "total_tool_calls": total_tool_calls,
         "avg_tool_calls": float(group["tool_calls"].mean()),
+        "tool_call_rate": tool_call_rate,
         "action_accuracy": float(np.mean(gold == pred)),
         "balanced_accuracy": balanced_accuracy,
         "macro_f1": float(
@@ -423,8 +477,19 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
         "overcall_rate": _safe_rate(
             np.sum(pred[gold_none] != "NONE"), int(gold_none.sum()), "overcall"
         ),
+        "no_call_precision": _safe_rate(
+            np.sum(gold[pred_none] == "NONE"), int(pred_none.sum()), "no-call precision"
+        ),
+        "no_call_recall": _safe_rate(
+            np.sum(pred[gold_none] == "NONE"), int(gold_none.sum()), "no-call recall"
+        ),
         "under_call_rate": _safe_rate(
             np.sum(pred[gold_need] == "NONE"), int(gold_need.sum()), "under-call"
+        ),
+        "category_accuracy_needed_given_call": _safe_rate(
+            np.sum(pred[needed_with_valid_call] == gold[needed_with_valid_call]),
+            int(needed_with_valid_call.sum()),
+            "needed category accuracy given a valid call",
         ),
         "wrong_category_rate": _safe_rate(
             np.sum(
@@ -436,6 +501,12 @@ def _per_run_metric_row(group: pd.DataFrame) -> dict[str, Any]:
         ),
         "invalid_tool_rate": float(group["has_invalid_tool"].mean()),
         "mixed_call_rate": float(group["mixed_calls"].mean()),
+        "multi_call_rate": float(multi_call.mean()),
+        "mixed_over_multicall_rate": _safe_rate(
+            np.sum(group["mixed_calls"].to_numpy(dtype=bool) & multi_call),
+            int(multi_call.sum()),
+            "mixed over multi-call",
+        ),
         "majority_accuracy_baseline": float(prior.max()),
         "prior_matched_expected_accuracy": float(np.square(prior.to_numpy()).sum()),
     }
@@ -505,7 +576,7 @@ def summarize_run_metrics(per_run: pd.DataFrame) -> pd.DataFrame:
             rows.append(
                 {
                     "setting": setting,
-                    "n_runs": int(len(group)),
+                    "n_runs": int(len(values)),
                     "metric": metric,
                     "mean": mean,
                     "population_sd": population_sd,
@@ -616,6 +687,185 @@ def build_error_tables(
                     }
                 )
     return pd.DataFrame(count_rows), pd.DataFrame(rate_rows), pd.DataFrame(class_rows)
+
+
+def build_needed_category_analysis(frame: pd.DataFrame) -> pd.DataFrame:
+    """Break down routing and answer outcomes for gold A/B/C tasks per run."""
+
+    rows: list[dict[str, Any]] = []
+    for (setting, run_id, seed), run_group in frame.groupby(
+        ["setting", "run_id", "seed"], sort=True
+    ):
+        for gold_action in TOOL_ACTIONS:
+            group = run_group[run_group["gold_action"] == gold_action]
+            n_tasks = len(group)
+            pred = group["pred_action"]
+            correct_category = pred == gold_action
+            under_call = pred == "NONE"
+            wrong_category = pred.isin(TOOL_ACTIONS) & ~correct_category
+            invalid_tool = group["has_invalid_tool"]
+            correct_category_wrong_answer = correct_category & ~group["final_correct"]
+            final_success = correct_category & group["final_correct"]
+            row: dict[str, Any] = {
+                "setting": setting,
+                "run_id": run_id,
+                "seed": int(seed),
+                "gold_action": gold_action,
+                "n_tasks": n_tasks,
+            }
+            for name, mask in (
+                ("call_correct_category", correct_category),
+                ("under_call", under_call),
+                ("wrong_category", wrong_category),
+                ("invalid_tool", invalid_tool),
+                (
+                    "correct_category_wrong_answer",
+                    correct_category_wrong_answer,
+                ),
+                ("needed_final_success", final_success),
+            ):
+                count = int(mask.sum())
+                row[f"{name}_count"] = count
+                row[f"{name}_rate"] = _safe_rate(
+                    count, n_tasks, f"needed category {gold_action}/{name}"
+                )
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_none_analysis(frame: pd.DataFrame) -> pd.DataFrame:
+    """Break down direct answers and first-action over-calls on gold NONE tasks."""
+
+    rows: list[dict[str, Any]] = []
+    for (setting, run_id, seed), run_group in frame.groupby(
+        ["setting", "run_id", "seed"], sort=True
+    ):
+        group = run_group[run_group["gold_action"] == "NONE"]
+        n_tasks = len(group)
+        pred = group["pred_action"]
+        masks: dict[str, pd.Series] = {
+            "no_call_correct": (pred == "NONE") & group["final_correct"],
+            "direct_answer_wrong": group["outcome"] == "direct_answer_wrong",
+            "overcall_A": pred == "A",
+            "overcall_B": pred == "B",
+            "overcall_C": pred == "C",
+            "overcall_INVALID": pred == "INVALID",
+            "overcall_total": pred != "NONE",
+            "any_invalid_tool": group["has_invalid_tool"],
+        }
+        row: dict[str, Any] = {
+            "setting": setting,
+            "run_id": run_id,
+            "seed": int(seed),
+            "n_tasks": n_tasks,
+        }
+        for name, mask in masks.items():
+            count = int(mask.sum())
+            row[f"{name}_count"] = count
+            row[f"{name}_rate"] = _safe_rate(count, n_tasks, f"NONE analysis/{name}")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _multicall_group_summary(group: pd.DataFrame) -> dict[str, Any]:
+    n_tasks = len(group)
+    tool_calls = group["tool_calls"].to_numpy(dtype=int)
+    zero_call = tool_calls == 0
+    one_call = tool_calls == 1
+    any_call = tool_calls > 0
+    multi_call = tool_calls > 1
+    mixed_multicall = multi_call & group["mixed_calls"].to_numpy(dtype=bool)
+    mixed_sequences = group.loc[mixed_multicall, "category_sequence_text"]
+    sequence_counts = sorted(
+        (
+            (str(sequence).replace(">", "->"), int(count))
+            for sequence, count in mixed_sequences.value_counts().items()
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    top_sequences = [
+        {
+            "rank": rank,
+            "category_sequence": sequence,
+            "count": count,
+            "rate_within_multicall": _safe_rate(
+                count, int(multi_call.sum()), f"top multi-call sequence rank {rank}"
+            ),
+            "rate_within_mixed": _safe_rate(
+                count, int(mixed_multicall.sum()), f"top mixed sequence rank {rank}"
+            ),
+        }
+        for rank, (sequence, count) in enumerate(sequence_counts[:10], start=1)
+    ]
+    result: dict[str, Any] = {
+        "n_tasks": n_tasks,
+        "total_tool_calls": int(tool_calls.sum()),
+        "tool_call_rate": math.nan
+        if n_tasks == 0
+        else float(tool_calls.sum() / n_tasks),
+        "zero_call_count": int(zero_call.sum()),
+        "zero_call_rate": _safe_rate(int(zero_call.sum()), n_tasks, "zero-call rate"),
+        "any_tool_call_count": int(any_call.sum()),
+        "any_tool_call_rate": _safe_rate(
+            int(any_call.sum()), n_tasks, "any-tool-call rate"
+        ),
+        "one_call_count": int(one_call.sum()),
+        "one_call_rate": _safe_rate(int(one_call.sum()), n_tasks, "one-call rate"),
+        "multi_call_count": int(multi_call.sum()),
+        "multi_call_rate": _safe_rate(
+            int(multi_call.sum()), n_tasks, "multi-call rate"
+        ),
+        "mixed_multicall_count": int(mixed_multicall.sum()),
+        "mixed_category_task_count": int(mixed_multicall.sum()),
+        "mixed_over_all_rate": _safe_rate(
+            int(mixed_multicall.sum()), n_tasks, "mixed over all tasks"
+        ),
+        "mixed_over_multicall_rate": _safe_rate(
+            int(mixed_multicall.sum()),
+            int(multi_call.sum()),
+            "mixed over multi-call",
+        ),
+        "top_category_sequences_json": json.dumps(
+            top_sequences, ensure_ascii=False, separators=(",", ":")
+        ),
+    }
+    for rank in range(1, 4):
+        if rank <= len(top_sequences):
+            top = top_sequences[rank - 1]
+            result[f"top_{rank}_category_sequence"] = top["category_sequence"]
+            result[f"top_{rank}_sequence_count"] = top["count"]
+            result[f"top_{rank}_sequence_rate_within_multicall"] = top[
+                "rate_within_multicall"
+            ]
+            result[f"top_{rank}_sequence_rate_within_mixed"] = top["rate_within_mixed"]
+        else:
+            result[f"top_{rank}_category_sequence"] = None
+            result[f"top_{rank}_sequence_count"] = 0
+            result[f"top_{rank}_sequence_rate_within_multicall"] = math.nan
+            result[f"top_{rank}_sequence_rate_within_mixed"] = math.nan
+    return result
+
+
+def build_multicall_tables(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Summarize call multiplicity and the ten most common multi-call sequences."""
+
+    summary_rows: list[dict[str, Any]] = []
+    by_gold_rows: list[dict[str, Any]] = []
+    for (setting, run_id, seed), group in frame.groupby(
+        ["setting", "run_id", "seed"], sort=True
+    ):
+        base = {"setting": setting, "run_id": run_id, "seed": int(seed)}
+        summary_rows.append({**base, **_multicall_group_summary(group)})
+        for gold_action in ACTIONS:
+            action_group = group[group["gold_action"] == gold_action]
+            by_gold_rows.append(
+                {
+                    **base,
+                    "gold_action": gold_action,
+                    **_multicall_group_summary(action_group),
+                }
+            )
+    return pd.DataFrame(summary_rows), pd.DataFrame(by_gold_rows)
 
 
 def paired_bootstrap_comparisons(
@@ -1031,7 +1281,11 @@ def _summary_payload(
         "outcome_plot_order": list(OUTCOME_ORDER),
         "error_hierarchy": list(ERROR_HIERARCHY),
         "metric_definitions": METRIC_DEFINITIONS,
-        "aggregation": "Per-run metrics followed by arithmetic mean and population SD (ddof=0).",
+        "table_definitions": TABLE_DEFINITIONS,
+        "aggregation": (
+            "Per-run metrics followed by arithmetic mean and population SD (ddof=0). "
+            "Undefined conditional rates are omitted; n_runs is reported per metric."
+        ),
         "paired_bootstrap": {
             "method": "Two-way paired cluster bootstrap over task IDs and seeds; deltas are setting_b - setting_a.",
             "n_bootstrap": n_bootstrap,
@@ -1090,6 +1344,9 @@ def collect_action_statistics(
     confusion_counts, confusion_rates = build_confusion_tables(frame)
     recall_summary = build_action_recall_summary(per_run)
     error_counts, error_rates, class_error_rates = build_error_tables(frame)
+    needed_category_analysis = build_needed_category_analysis(frame)
+    none_analysis = build_none_analysis(frame)
+    multicall_summary, multicall_by_gold = build_multicall_tables(frame)
     paired = paired_bootstrap_comparisons(
         frame, n_bootstrap=n_bootstrap, bootstrap_seed=bootstrap_seed
     )
@@ -1110,6 +1367,10 @@ def collect_action_statistics(
         "outcome_counts.csv": error_counts,
         "outcome_rates.csv": error_rates,
         "class_outcome_rates.csv": class_error_rates,
+        "needed_category_analysis.csv": needed_category_analysis,
+        "none_analysis.csv": none_analysis,
+        "multicall_summary.csv": multicall_summary,
+        "multicall_by_gold.csv": multicall_by_gold,
         "paired_bootstrap_comparisons.csv": paired,
     }
     if label_distribution is not None:
