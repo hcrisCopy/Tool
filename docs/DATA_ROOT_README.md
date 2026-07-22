@@ -12,14 +12,28 @@ CallTool_data/
 ├── hfd.sh                             # 通用资源下载辅助脚本，不含凭据
 └── when2tool_precise_shield/
     └── qwen3-4b-instruct-2507/
-        ├── data/
-        ├── labels/
-        ├── manifests/
+        ├── data/                             # scoped/full-tools 处理数据及 manifest
+        ├── labels/qwen3-4b-instruct-2507/   # 三种标签口径及生成审计
         ├── probes/
+        │   ├── fulltools/                   # binary/四动作/逐层/跨环境 probe
+        │   ├── scoped/                      # 当前 scoped-adapted binary probe
+        │   └── scoped_original_w2t/         # 原始 W2T probe、receipt、audit_source
         ├── outputs/
+        │   ├── fulltools/                   # full-menu prompt 与 P&P 轨迹（待生成）
+        │   ├── scoped_adapted/              # 当前 scoped prompt 与 P&P 轨迹
+        │   └── scoped_original_w2t/         # 严格重标与原始 probe P&P（待生成）
         ├── analysis/
+        │   ├── fulltools/                   # full-menu 统计与图表（待生成）
+        │   ├── scoped_adapted/              # adapted scoped 统计与图表（待生成）
+        │   └── scoped_original_w2t/         # original-W2T 统计与图表（待生成）
+        ├── manifests/                       # runtime provenance、formal audit、handoff
         ├── logs/
-        └── reports/
+        │   ├── setup/                       # 环境安装记录
+        │   ├── labels/                      # 标签生成日志
+        │   ├── hidden/                      # hidden 抽取日志
+        │   ├── probes/                      # probe 训练与评测日志
+        │   └── behavior/                    # 行为生成日志
+        └── reports/                         # Git 阶段报告的普通文件副本
 ```
 
 主 run root 为 `when2tool_precise_shield/qwen3-4b-instruct-2507/`。其中：

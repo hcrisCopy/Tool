@@ -11,8 +11,31 @@
 ├── Qwen/
 │   └── Qwen3-4B-Instruct-2507/   # 共享基础模型
 └── CallTool/
-    ├── CallTool_code/            # 本 Git 仓库
-    └── CallTool_data/            # 数据、运行产物、日志和图表
+    ├── CallTool_code/                         # 本 Git 仓库
+    │   ├── when2tool_action/                  # 核心 Python 包
+    │   │   ├── configs/                      # 模型、路径和实验协议配置
+    │   │   └── scripts/                      # 数据、标签、probe、评测、统计 CLI
+    │   ├── scripts/                           # 整阶段 Bash 调度脚本
+    │   ├── tests/                             # 单元测试与协议篡改测试
+    │   ├── third_party/when2tool/             # 固定 commit 的上游子模块
+    │   ├── docs/                              # 实验方案、数据清单和服务器说明
+    │   └── reports/
+    │       ├── stages/                        # 当前方案阶段报告
+    │       └── archive/                       # 已废弃方案的历史报告
+    └── CallTool_data/                         # 不进入 Git 的数据与运行产物
+        ├── When2Tool/                         # 固定 revision 的原始数据集
+        ├── conda_envs/                        # 项目独立 Conda 环境
+        ├── cache/                             # 可再生安装缓存，不是正式产物
+        └── when2tool_precise_shield/
+            └── qwen3-4b-instruct-2507/        # 当前模型的主 run root
+                ├── data/                      # category/scoped/full-tools 数据
+                ├── labels/                    # hard-no-tool 与 A/B/C/NONE 标签
+                ├── probes/                    # hidden、probe 权重和探测图表
+                ├── outputs/                   # prompt、P&P 与重标行为轨迹
+                ├── analysis/                  # 三种协议的统计 CSV/JSON/PNG
+                ├── manifests/                 # provenance、审计和交接清单
+                ├── logs/                      # setup/labels/hidden/probes/behavior 日志
+                └── reports/                   # 阶段报告的数据盘副本
 ```
 
 所有命令均从 `CallTool_code/` 执行。仓库目录请保持为 `CallTool_code`；代码使用相对路径，不依赖个人电脑或服务器绝对路径。
@@ -63,19 +86,7 @@ STAGE_START=fresh bash scripts/run_statistics_stage.sh
 
 ## 输出说明
 
-```text
-../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507/
-├── data/           # 处理后的数据
-├── labels/         # NONE/A/B/C 标签
-├── probes/         # hidden、probe 权重和探测结果
-├── outputs/        # 行为轨迹
-├── analysis/       # 统计表、summary.json 和关键图表
-├── manifests/      # provenance 与交接清单
-├── logs/           # 运行日志
-└── reports/        # 阶段报告副本
-```
-
-完整统计阶段结束后应生成三套 `analysis/*/summary.json`、`manifests/formal_stage_audit.json` 和 `manifests/stage_handoff.json`。当前 partial checkpoint 尚无这些最终文件是正常状态。
+各目录用途见上面的完整目录树。完整统计阶段结束后应生成三套 `analysis/*/summary.json`、`manifests/formal_stage_audit.json` 和 `manifests/stage_handoff.json`。当前 partial checkpoint 尚无这些最终文件是正常状态。
 
 ## 文档入口
 
