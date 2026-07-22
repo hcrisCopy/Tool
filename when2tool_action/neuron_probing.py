@@ -815,7 +815,6 @@ def fit_selected_feature_probes(
         train_y: np.ndarray, test_y: np.ndarray, n_classes: int
     ) -> tuple[dict[str, float], LogisticRegression]:
         classifier = LogisticRegression(
-            penalty="l2",
             C=c,
             solver="lbfgs",
             max_iter=5000,
