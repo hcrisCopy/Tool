@@ -2,16 +2,27 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+.staging-*/
+*.bundle
 .venv/
 .idea/
 .vscode/
 
 # Runtime artifacts belong in the sibling CallTool_data directory.
-data/
-outputs/
-probe_data/
-figures/
-logs/
+/data/
+/outputs/
+/probe_data/
+/figures/
+/logs/
+/analysis/
+/labels/
+/probes/
+/manifests/
+/checkpoints/
+/cache/
+/visualizations/
 *.log
 
 # Large tensors, datasets, and checkpoints must never enter Git.
@@ -21,4 +32,3 @@ logs/
 *.parquet
 *.npy
 *.npz
-

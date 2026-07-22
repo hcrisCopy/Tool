@@ -1,4 +1,6 @@
-# 阶段 1：Qwen3-4B-Instruct-2507 onset 探测
+# 已归档（旧方案）：Qwen3-4B-Instruct-2507 onset 探测
+
+> 本文对应已废弃的 `experiments_2d/onset` 方案，仅保留作历史审计，不属于当前 full-menu 精确统计方案，也不得作为当前论文证据引用。
 
 日期：2026-07-21  
 状态：完成正式 seed-0 标签、全量 hidden 提取、When2Tool 全层 probe 基线和 200 次置换 onset 扫描；按预注册里程碑暂停，尚未进入神经元筛选与因果干预。
@@ -79,9 +81,9 @@ Z_l  = (S_l - mean(S_l^null)) / (std(S_l^null) + 1e-6)
 
 结论：目前不能把总体 `type onset=20` 解释为 A/B/C 三类都存在的统一类型机制。B 有清楚峰值但 H 状态仅临界；A 和 C 未通过 environment-block FWER 检验。直接进入“共享/特异 type 神经元”会有把 B 类或 environment 语义误写成三类机制的风险。
 
-## 6. 产物
+## 6. 历史产物位置（现已删除）
 
-远端数据根目录均相对代码仓库为：
+旧方案曾使用以下相对目录；该 `experiments_2d` 数据树已在当前方案完成可复用 original-W2T 子集的审计迁移后删除，不应重建。仍需保留的文件及 SHA 由当前数据树 `probes/scoped_original_w2t/migration_receipt.json` 固化。
 
 ```text
 ../CallTool_data/experiments_2d/qwen3-4b-instruct-2507/
@@ -102,15 +104,14 @@ Z_l  = (S_l - mean(S_l^null)) / (std(S_l^null) + 1e-6)
     └── residual_scalers.pt
 ```
 
-输入文件 SHA256、固定上游 commit、hidden 协议版本和 `P_all` 菜单 SHA256 均已写入 `onset_summary.json`。
+历史运行时，输入文件 SHA256、固定上游 commit、hidden 协议版本和 `P_all` 菜单 SHA256 均写入了当时的 `onset_summary.json`；该旧数据树现已删除，当前只以本归档说明和 Git 历史追溯，不应把该路径当成现存产物。
 
-## 7. 建议的下一步（等待确认后执行）
+## 7. 历史建议（不再作为当前路线）
 
-在进入 `(l,i)` 神经元筛选前，建议增加一个不改变主分析的确认层：
+以下文字只记录旧方案当时的判断；当前路线已由 full-menu 精确统计方案替代：
 
 1. 保留当前 `l_y*=23` 作为预注册主结论；新增“最早 FWER 显著层”作为明确标注的 secondary 指标，不可事后替换主定义。
 2. necessity 使用 difficulty/environment 条件内的对照或 medium held-out 检验，确认当前早层可检测信号不是 easy-vs-hard 难度或词面差异。
 3. 只需补跑 seed 1/2 的 no-tool train 标签即可复用现有 hidden，检查 `l_y*` 和 clean-set 构成对生成随机性的稳定性。
 4. type 先做 environment-held-out / leave-one-environment-out 的类别验证；若仍只有 B 稳定，则把结论收缩为类型非对称，并分别报告 A/B/C，而不是用总体均值宣称统一 type onset。
 5. 通过以上确认后，再冻结 necessity 与 type 的候选层窗口，进入 raw hidden 标量筛选、稀疏 probe 及 mask/patch 因果实验。
-
