@@ -16,7 +16,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import numpy as np
@@ -60,6 +60,262 @@ TRANSFER_FILES = (
     "probe_no_reasoning.pt",
     "probe_results_no_reasoning.json",
 )
+EXPECTED_SOURCE_ARTIFACTS = 17
+EXPECTED_DESTINATION_ARTIFACTS = 19
+EXPECTED_AUDIT_SOURCES = 10
+
+
+def legacy_audit_source_paths(legacy_root: Path, seed: int) -> tuple[Path, ...]:
+    """Exact legacy evidence retained so the import remains independently auditable."""
+
+    paths: list[Path] = []
+    for split in ("train", "test"):
+        label_dir = legacy_root / "labels" / "full" / f"seed_{seed}"
+        paths.extend(
+            (
+                label_dir / f"{split}_no_tool_outputs.json",
+                label_dir / f"{split}_label_stats.csv",
+                label_dir / f"{split}_manifest.json",
+            )
+        )
+        hidden_dir = legacy_root / "hidden" / "full" / "P_env"
+        paths.extend(
+            (
+                hidden_dir / f"{split}_manifest.json",
+                hidden_dir / f"{split}_metadata.json",
+            )
+        )
+    return tuple(paths)
+
+
+def _audit_source_relatives(seed: int) -> tuple[str, ...]:
+    sentinel = Path("__legacy_root__")
+    return tuple(
+        path.relative_to(sentinel).as_posix()
+        for path in legacy_audit_source_paths(sentinel, seed)
+    )
+
+
+def _expected_receipt_inventory(
+    model_slug: str, seed: int
+) -> tuple[
+    set[str],
+    set[str],
+    dict[str, str],
+]:
+    """Return the exact source, destination, and audit mappings for an import."""
+
+    probe_relative = PurePosixPath("probes") / PROTOCOL_ID
+    source_paths = {
+        (PurePosixPath("baseline") / "w2t_all" / name).as_posix()
+        for name in TRANSFER_FILES
+    }
+    destination_paths = {
+        (probe_relative / name).as_posix() for name in TRANSFER_FILES
+    }
+    audit_mapping: dict[str, str] = {}
+    for source_relative in _audit_source_relatives(seed):
+        destination_relative = (
+            probe_relative / "audit_source" / PurePosixPath(source_relative)
+        ).as_posix()
+        source_paths.add(source_relative)
+        destination_paths.add(destination_relative)
+        audit_mapping[source_relative] = destination_relative
+    destination_paths.update(
+        {
+            (
+                PurePosixPath("labels")
+                / model_slug
+                / f"{split}_labels_no_reasoning_{PROTOCOL_ID}.json"
+            ).as_posix()
+            for split in ("train", "test")
+        }
+    )
+    if len(source_paths) != EXPECTED_SOURCE_ARTIFACTS:
+        raise AssertionError(
+            f"Importer source inventory changed: {len(source_paths)} "
+            f"!= {EXPECTED_SOURCE_ARTIFACTS}"
+        )
+    if len(destination_paths) != EXPECTED_DESTINATION_ARTIFACTS:
+        raise AssertionError(
+            f"Importer destination inventory changed: {len(destination_paths)} "
+            f"!= {EXPECTED_DESTINATION_ARTIFACTS}"
+        )
+    if len(audit_mapping) != EXPECTED_AUDIT_SOURCES:
+        raise AssertionError(
+            f"Importer audit inventory changed: {len(audit_mapping)} "
+            f"!= {EXPECTED_AUDIT_SOURCES}"
+        )
+    return source_paths, destination_paths, audit_mapping
+
+
+def _resolved_receipt_path(root: Path, relative: str, context: str) -> Path:
+    if not isinstance(relative, str) or not relative:
+        raise TypeError(f"{context} must be a non-empty POSIX relative path")
+    parsed = PurePosixPath(relative)
+    if (
+        parsed.is_absolute()
+        or parsed.as_posix() != relative
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+    ):
+        raise ValueError(f"{context} is not a canonical relative path: {relative!r}")
+    resolved_root = root.resolve()
+    target = resolved_root.joinpath(*parsed.parts).resolve()
+    if target == resolved_root or resolved_root not in target.parents:
+        raise ValueError(f"{context} escapes its registered root: {relative!r}")
+    return target
+
+
+def validate_imported_scoped_destination(
+    receipt: Mapping[str, Any],
+    *,
+    output_root: Path,
+    model_slug: str,
+    label_seed: int,
+    artifact_root: Path | None = None,
+) -> None:
+    """Validate a complete import without reading the legacy source directory.
+
+    ``artifact_root`` may be a same-filesystem staging mirror.  Receipt paths
+    always remain relative to the final ``output_root`` layout.
+    """
+
+    output_root = output_root.resolve()
+    artifact_root = output_root if artifact_root is None else artifact_root.resolve()
+    expected_sources, expected_destinations, expected_audit = (
+        _expected_receipt_inventory(model_slug, label_seed)
+    )
+
+    source_hashes = receipt.get("source_artifact_sha256")
+    destination_hashes = receipt.get("destination_artifact_sha256")
+    if not isinstance(source_hashes, dict):
+        raise TypeError("receipt.source_artifact_sha256 must be an object")
+    if not isinstance(destination_hashes, dict):
+        raise TypeError("receipt.destination_artifact_sha256 must be an object")
+    if set(source_hashes) != expected_sources:
+        raise ValueError(
+            "Receipt source inventory differs from the fixed 17-file protocol: "
+            f"missing={sorted(expected_sources-set(source_hashes))}, "
+            f"extra={sorted(set(source_hashes)-expected_sources)}"
+        )
+    if set(destination_hashes) != expected_destinations:
+        raise ValueError(
+            "Receipt destination inventory differs from the fixed 19-file protocol: "
+            f"missing={sorted(expected_destinations-set(destination_hashes))}, "
+            f"extra={sorted(set(destination_hashes)-expected_destinations)}"
+        )
+    for relative, digest in source_hashes.items():
+        _require_sha256(digest, f"receipt source hash {relative}")
+    for relative, digest in destination_hashes.items():
+        _require_sha256(digest, f"receipt destination hash {relative}")
+        target = _resolved_receipt_path(
+            artifact_root, relative, f"receipt destination path {relative}"
+        )
+        if not target.is_file():
+            raise FileNotFoundError(target)
+        _equal(
+            sha256_file(target),
+            digest,
+            f"receipt destination file {relative} SHA256",
+        )
+
+    probe_relative = PurePosixPath("probes") / PROTOCOL_ID
+    for name in TRANSFER_FILES:
+        source_relative = (
+            PurePosixPath("baseline") / "w2t_all" / name
+        ).as_posix()
+        destination_relative = (probe_relative / name).as_posix()
+        _equal(
+            destination_hashes[destination_relative],
+            source_hashes[source_relative],
+            f"receipt transferred mapping {name}",
+        )
+
+    audit = receipt.get("audit_source")
+    if not isinstance(audit, dict):
+        raise TypeError("receipt.audit_source must be an object")
+    expected_audit_root = (probe_relative / "audit_source").as_posix()
+    _equal(audit.get("root"), expected_audit_root, "receipt audit root")
+    if audit.get("self_contained_after_legacy_source_removal") is not True:
+        raise ValueError(
+            "receipt audit source must explicitly be self-contained after source removal"
+        )
+    files = audit.get("files")
+    if not isinstance(files, list) or len(files) != EXPECTED_AUDIT_SOURCES:
+        raise ValueError(
+            f"receipt.audit_source.files must contain exactly {EXPECTED_AUDIT_SOURCES} items"
+        )
+    seen_sources: set[str] = set()
+    seen_destinations: set[str] = set()
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict) or set(entry) != {
+            "source_relative_path",
+            "destination_relative_path",
+            "sha256",
+        }:
+            raise ValueError(f"receipt.audit_source.files[{index}] has invalid keys")
+        source_relative = entry["source_relative_path"]
+        destination_relative = entry["destination_relative_path"]
+        digest = entry["sha256"]
+        if not isinstance(source_relative, str) or not isinstance(
+            destination_relative, str
+        ):
+            raise TypeError(f"receipt.audit_source.files[{index}] paths must be strings")
+        if source_relative in seen_sources or destination_relative in seen_destinations:
+            raise ValueError("receipt.audit_source.files contains duplicate paths")
+        seen_sources.add(source_relative)
+        seen_destinations.add(destination_relative)
+        _equal(
+            expected_audit.get(source_relative),
+            destination_relative,
+            f"receipt audit mapping {source_relative}",
+        )
+        _equal(
+            digest,
+            source_hashes.get(source_relative),
+            f"receipt audit source hash {source_relative}",
+        )
+        _equal(
+            digest,
+            destination_hashes.get(destination_relative),
+            f"receipt audit destination hash {destination_relative}",
+        )
+    if seen_sources != set(expected_audit) or seen_destinations != set(
+        expected_audit.values()
+    ):
+        raise ValueError("receipt.audit_source.files differs from the fixed whitelist")
+
+    data_manifest = output_root / "data" / "data_manifest.json"
+    if not data_manifest.is_file():
+        raise FileNotFoundError(data_manifest)
+    _equal(
+        receipt.get("destination_data_manifest_sha256"),
+        sha256_file(data_manifest),
+        "receipt destination data manifest SHA256",
+    )
+    expected_data_files = {
+        f"data/tasks_v1_{split}_category.json" for split in ("train", "test")
+    }
+    data_file_hashes = receipt.get("destination_data_files_sha256")
+    if not isinstance(data_file_hashes, dict) or set(data_file_hashes) != (
+        expected_data_files
+    ):
+        raise ValueError(
+            "receipt.destination_data_files_sha256 must bind exactly the scoped "
+            "train/test task files"
+        )
+    for relative, digest in data_file_hashes.items():
+        _require_sha256(digest, f"receipt data file hash {relative}")
+        data_file = _resolved_receipt_path(
+            output_root, relative, f"receipt data file path {relative}"
+        )
+        if not data_file.is_file():
+            raise FileNotFoundError(data_file)
+        _equal(
+            sha256_file(data_file),
+            digest,
+            f"receipt data file {relative} SHA256",
+        )
 
 
 @dataclass(frozen=True)
@@ -752,8 +1008,15 @@ def import_legacy_scoped_baseline(
         )
         for split in ("train", "test")
     }
+    data_file_hashes = {
+        f"data/tasks_v1_{split}_category.json": sha256_file(
+            data_dir / f"tasks_v1_{split}_category.json"
+        )
+        for split in ("train", "test")
+    }
     data_manifest_path = data_dir / "data_manifest.json"
     data_manifest = _object(data_manifest_path)
+    data_manifest_sha256 = sha256_file(data_manifest_path)
     _equal(data_manifest.get("schema_version"), SCHEMA_VERSION, "data manifest schema")
     data_splits = data_manifest.get("splits")
     if not isinstance(data_splits, dict):
@@ -888,8 +1151,17 @@ def import_legacy_scoped_baseline(
     )
     source_hashes[_relative_key(probe_path, legacy_root)] = sha256_file(probe_path)
     source_hashes[_relative_key(result_path, legacy_root)] = sha256_file(result_path)
+    audit_sources = legacy_audit_source_paths(
+        legacy_root, config.generation.seeds[0]
+    )
+    for source in audit_sources:
+        source_hashes[_relative_key(source, legacy_root)] = sha256_file(source)
 
     probe_output = output_root / "probes" / PROTOCOL_ID
+    audit_destinations = {
+        source: probe_output / "audit_source" / source.relative_to(legacy_root)
+        for source in audit_sources
+    }
     labels_output = output_root / "labels" / config.model.slug
     label_paths = {
         split: labels_output
@@ -897,92 +1169,242 @@ def import_legacy_scoped_baseline(
         for split in ("train", "test")
     }
     receipt_path = probe_output / "migration_receipt.json"
-    targets = [
+    artifact_targets = [
         *(probe_output / name for name in TRANSFER_FILES),
+        *audit_destinations.values(),
         *label_paths.values(),
-        receipt_path,
     ]
-    existing = [path for path in targets if path.exists()]
+    targets = [*artifact_targets, receipt_path]
+    expected_sources, expected_destinations, _ = _expected_receipt_inventory(
+        config.model.slug, config.generation.seeds[0]
+    )
+    if set(source_hashes) != expected_sources:
+        raise ValueError(
+            "Validated legacy source inventory differs from the fixed protocol: "
+            f"missing={sorted(expected_sources-set(source_hashes))}, "
+            f"extra={sorted(set(source_hashes)-expected_sources)}"
+        )
+    target_relatives = {
+        _relative_key(path, output_root) for path in artifact_targets
+    }
+    if target_relatives != expected_destinations:
+        raise AssertionError("Importer target construction differs from receipt protocol")
+    if len(targets) != len(set(targets)):
+        raise AssertionError("Importer target paths are not unique")
+    for relative in sorted(target_relatives | {_relative_key(receipt_path, output_root)}):
+        _resolved_receipt_path(output_root, relative, f"import target {relative}")
+    existing = [path for path in targets if os.path.lexists(path)]
     if existing and not overwrite:
         raise FileExistsError(
             "Refusing to overwrite imported artifacts: "
             + ", ".join(str(path) for path in existing)
         )
+    invalid_targets = [
+        path
+        for path in existing
+        if path.is_dir() and not path.is_symlink()
+    ]
+    if invalid_targets:
+        raise ValueError(
+            "Importer targets must be files, not directories: "
+            + ", ".join(str(path) for path in invalid_targets)
+        )
 
-    for name in TRANSFER_FILES:
-        _atomic_transfer(
-            baseline_dir / name,
-            probe_output / name,
-            mode=transfer_mode,
-            overwrite=overwrite,
-        )
-    for split, path in label_paths.items():
-        atomic_write_json(
-            path,
-            _label_artifact(
-                validated[split].converted_rows, config=config, split=split
-            ),
-            overwrite=overwrite,
-        )
-    destination_hashes: dict[str, str] = {}
-    for name in TRANSFER_FILES:
-        source = baseline_dir / name
-        destination = probe_output / name
-        source_hash = sha256_file(source)
-        destination_hash = sha256_file(destination)
-        _equal(destination_hash, source_hash, f"transferred artifact {name} SHA256")
-        destination_hashes[_relative_key(destination, output_root)] = destination_hash
-    destination_hashes.update(
-        {
-            _relative_key(path, output_root): sha256_file(path)
-            for path in label_paths.values()
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{PROTOCOL_ID}.staging-", dir=output_root)
+    ).resolve()
+    publish_started = False
+    try:
+        def staged(final_path: Path) -> Path:
+            return staging_root / final_path.relative_to(output_root)
+
+        destination_hashes: dict[str, str] = {}
+        for name in TRANSFER_FILES:
+            source = baseline_dir / name
+            source_relative = _relative_key(source, legacy_root)
+            expected_source_hash = source_hashes[source_relative]
+            _equal(
+                sha256_file(source),
+                expected_source_hash,
+                f"source changed after validation: {source_relative}",
+            )
+            destination = probe_output / name
+            staged_destination = staged(destination)
+            _atomic_transfer(
+                source,
+                staged_destination,
+                mode=transfer_mode,
+                overwrite=False,
+            )
+            _equal(
+                sha256_file(source),
+                expected_source_hash,
+                f"source changed during transfer: {source_relative}",
+            )
+            destination_hash = sha256_file(staged_destination)
+            _equal(
+                destination_hash,
+                expected_source_hash,
+                f"staged transferred artifact {name} SHA256",
+            )
+            destination_hashes[_relative_key(destination, output_root)] = (
+                destination_hash
+            )
+
+        audit_receipt: list[dict[str, str]] = []
+        for source, destination in audit_destinations.items():
+            source_relative = _relative_key(source, legacy_root)
+            expected_source_hash = source_hashes[source_relative]
+            _equal(
+                sha256_file(source),
+                expected_source_hash,
+                f"audit source changed after validation: {source_relative}",
+            )
+            staged_destination = staged(destination)
+            _atomic_transfer(
+                source,
+                staged_destination,
+                mode=transfer_mode,
+                overwrite=False,
+            )
+            _equal(
+                sha256_file(source),
+                expected_source_hash,
+                f"audit source changed during transfer: {source_relative}",
+            )
+            destination_hash = sha256_file(staged_destination)
+            _equal(
+                destination_hash,
+                expected_source_hash,
+                f"staged audit source {source_relative} SHA256",
+            )
+            destination_relative = _relative_key(destination, output_root)
+            destination_hashes[destination_relative] = destination_hash
+            audit_receipt.append(
+                {
+                    "source_relative_path": source_relative,
+                    "destination_relative_path": destination_relative,
+                    "sha256": destination_hash,
+                }
+            )
+
+        for split, path in label_paths.items():
+            staged_path = staged(path)
+            atomic_write_json(
+                staged_path,
+                _label_artifact(
+                    validated[split].converted_rows, config=config, split=split
+                ),
+                overwrite=False,
+            )
+            destination_hashes[_relative_key(path, output_root)] = sha256_file(
+                staged_path
+            )
+
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "protocol_id": PROTOCOL_ID,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "model": config.model.slug,
+            "upstream_commit": UPSTREAM_COMMIT,
+            "config_sha256": sha256_file(config.source),
+            "transfer_mode": transfer_mode,
+            "source_artifact_sha256": dict(sorted(source_hashes.items())),
+            "destination_data_manifest_sha256": data_manifest_sha256,
+            "destination_data_files_sha256": dict(sorted(data_file_hashes.items())),
+            "destination_artifact_sha256": dict(sorted(destination_hashes.items())),
+            "audit_source": {
+                "root": _relative_key(
+                    probe_output / "audit_source", output_root
+                ),
+                "files": audit_receipt,
+                "self_contained_after_legacy_source_removal": True,
+            },
+            "splits": {
+                split: {
+                    "n": len(validated[split].baseline_meta),
+                    "tool_necessary": validated[split].necessary,
+                    "task_ids_sha256": validated[split].task_ids_sha256,
+                    "hidden_shape": list(validated[split].hidden.shape),
+                    "hidden_dtype": str(validated[split].hidden.dtype),
+                }
+                for split in ("train", "test")
+            },
+            "probe_validation": {
+                "C": 0.0001,
+                "layer": "all",
+                "n_layers": config.model.num_hidden_layers + 1,
+                "hidden_dim": config.model.hidden_size,
+                "official_double_standard_scaler_reconstructed": True,
+                "all_saved_metrics_recomputed": True,
+                "recomputed": recomputed,
+            },
+            "prompt_validation": {
+                "label_prompt": "exact pinned scoped hard-no-tool/no-reasoning render",
+                "hidden_prompt": "exact legacy original P_env/current/no-reasoning render",
+                "all_prompt_hashes_recomputed": True,
+            },
+            "compatibility": {
+                "probe_scope": "scoped-original-pinned",
+                "current_scoped_adapted": False,
+                "reason": (
+                    "The legacy P_env hidden renderer omitted the additional "
+                    "ListManipulation system contract used by the current renderer."
+                ),
+                "model_weight_hash_available_in_legacy_run": False,
+                "allowed_claim": (
+                    "original When2Tool scoped binary baseline reproduction"
+                ),
+            },
         }
-    )
-    receipt = {
-        "schema_version": SCHEMA_VERSION,
-        "protocol_id": PROTOCOL_ID,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "model": config.model.slug,
-        "upstream_commit": UPSTREAM_COMMIT,
-        "config_sha256": sha256_file(config.source),
-        "transfer_mode": transfer_mode,
-        "source_artifact_sha256": dict(sorted(source_hashes.items())),
-        "destination_data_manifest_sha256": sha256_file(data_manifest_path),
-        "destination_artifact_sha256": dict(sorted(destination_hashes.items())),
-        "splits": {
-            split: {
-                "n": len(validated[split].baseline_meta),
-                "tool_necessary": validated[split].necessary,
-                "task_ids_sha256": validated[split].task_ids_sha256,
-                "hidden_shape": list(validated[split].hidden.shape),
-                "hidden_dtype": str(validated[split].hidden.dtype),
-            }
-            for split in ("train", "test")
-        },
-        "probe_validation": {
-            "C": 0.0001,
-            "layer": "all",
-            "n_layers": config.model.num_hidden_layers + 1,
-            "hidden_dim": config.model.hidden_size,
-            "official_double_standard_scaler_reconstructed": True,
-            "all_saved_metrics_recomputed": True,
-            "recomputed": recomputed,
-        },
-        "prompt_validation": {
-            "label_prompt": "exact pinned scoped hard-no-tool/no-reasoning render",
-            "hidden_prompt": "exact legacy original P_env/current/no-reasoning render",
-            "all_prompt_hashes_recomputed": True,
-        },
-        "compatibility": {
-            "probe_scope": "scoped-original-pinned",
-            "current_scoped_adapted": False,
-            "reason": (
-                "The legacy P_env hidden renderer omitted the additional "
-                "ListManipulation system contract used by the current renderer."
-            ),
-            "model_weight_hash_available_in_legacy_run": False,
-            "allowed_claim": "original When2Tool scoped binary baseline reproduction",
-        },
-    }
-    atomic_write_json(receipt_path, receipt, overwrite=overwrite)
-    return receipt_path
+        staged_receipt = staged(receipt_path)
+        atomic_write_json(staged_receipt, receipt, overwrite=False)
+        validate_imported_scoped_destination(
+            receipt,
+            output_root=output_root,
+            artifact_root=staging_root,
+            model_slug=config.model.slug,
+            label_seed=config.generation.seeds[0],
+        )
+
+        if os.path.lexists(receipt_path):
+            invalidated_receipt = staging_root / ".previous_receipt.invalidated"
+            os.replace(receipt_path, invalidated_receipt)
+        publish_started = True
+        for destination in sorted(
+            artifact_targets, key=lambda path: _relative_key(path, output_root)
+        ):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged(destination), destination)
+        validate_imported_scoped_destination(
+            receipt,
+            output_root=output_root,
+            model_slug=config.model.slug,
+            label_seed=config.generation.seeds[0],
+        )
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged_receipt, receipt_path)
+        validate_imported_scoped_destination(
+            _object(receipt_path),
+            output_root=output_root,
+            model_slug=config.model.slug,
+            label_seed=config.generation.seeds[0],
+        )
+        return receipt_path
+    except Exception as error:
+        if publish_started:
+            if os.path.lexists(receipt_path):
+                if receipt_path.is_dir() and not receipt_path.is_symlink():
+                    raise RuntimeError(
+                        "Scoped import failed after publication began, and the "
+                        f"receipt path became a directory: {receipt_path}"
+                    ) from error
+                receipt_path.unlink()
+            raise RuntimeError(
+                "Scoped import failed after publication began. A valid migration "
+                "receipt was deliberately withheld; partial destination files may "
+                "remain. Fix the reported cause and rerun with --overwrite."
+            ) from error
+        raise
+    finally:
+        shutil.rmtree(staging_root)

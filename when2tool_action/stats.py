@@ -33,6 +33,11 @@ import pandas as pd
 import seaborn as sns
 from sklearn.metrics import f1_score
 
+from .constants import SCHEMA_VERSION as ACTION_SCHEMA_VERSION
+from .constants import UPSTREAM_COMMIT
+from .evaluation_contract import validate_action_row
+from .io_utils import sha256_file
+
 
 ACTIONS = ("NONE", "A", "B", "C")
 PREDICTIONS = (*ACTIONS, "INVALID")
@@ -64,8 +69,16 @@ BOOTSTRAP_METRICS = (
     "action_accuracy",
     "avg_tool_calls",
     "total_tool_calls_per_run",
+    "balanced_accuracy",
+    "macro_f1",
+    "toolneed_f1",
+    "recall_NONE",
+    "recall_A",
+    "recall_B",
+    "recall_C",
+    "overcall_rate",
 )
-SCHEMA_VERSION = "when2tool_action_stats.v2"
+SCHEMA_VERSION = "when2tool_action_stats.v3"
 
 METRIC_DEFINITIONS = {
     "final_accuracy": "Fraction of tasks whose final answer is correct.",
@@ -121,6 +134,19 @@ TABLE_DEFINITIONS = {
     "multicall_by_gold.csv": (
         "The multicall summary split by gold NONE/A/B/C, including top "
         "mixed-category sequence counts."
+    ),
+    "run_diagnostics.csv": (
+        "One row per setting/run with mutually exclusive termination counts, "
+        "tool-parse failures, and explicit [SAFETY_REJECTED] tool results."
+    ),
+    "gold_action_final_accuracy_summary.csv": (
+        "Final-answer accuracy grouped by setting and gold action, aggregated "
+        "over complete runs as mean and population SD."
+    ),
+    "current_relative_tradeoff_summary.csv": (
+        "Per-setting mean and population SD for tool-call reduction, accuracy "
+        "loss, and accuracy loss per saved call relative to the matching current "
+        "setting and seed."
     ),
 }
 
@@ -228,25 +254,16 @@ def _optional_event_boolean(
     return row_value if row_value is not None else event_value
 
 
-def _classify_outcome(
-    gold_action: str,
-    pred_action: str,
-    final_correct: bool,
-    has_invalid_tool: bool,
-) -> str:
-    """Apply the preregistered, mutually exclusive error hierarchy."""
+def _contains_safety_rejection(value: Any) -> bool:
+    """Detect the explicit runtime marker without treating every failure as safety."""
 
-    if has_invalid_tool:
-        return "invalid_tool"
-    if gold_action == "NONE":
-        if pred_action == "NONE":
-            return "success" if final_correct else "direct_answer_wrong"
-        return "over_call"
-    if pred_action == "NONE":
-        return "under_call"
-    if pred_action != gold_action:
-        return "wrong_category"
-    return "success" if final_correct else "correct_category_wrong_answer"
+    if isinstance(value, str):
+        return "[SAFETY_REJECTED]" in value
+    if isinstance(value, Mapping):
+        return any(_contains_safety_rejection(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_safety_rejection(item) for item in value)
+    return False
 
 
 def _derive_row(
@@ -260,11 +277,9 @@ def _derive_row(
         "id",
         "run_id",
         "seed",
-        "gold_action",
-        "routed_tool_events",
-        "tool_calls",
-        "final_correct",
         "setting",
+        "termination_reason",
+        "tool_parse_failures",
     }
     missing = sorted(required - set(row))
     if missing:
@@ -283,41 +298,47 @@ def _derive_row(
         )
 
     task_id = _canonical_identifier(row["id"], f"{context}.id")
-    gold_action = row["gold_action"]
-    if gold_action not in ACTIONS:
-        raise ValueError(
-            f"{context}.gold_action must be one of {ACTIONS}, got {gold_action!r}"
-        )
-    final_correct = _require_bool(row["final_correct"], f"{context}.final_correct")
-    tool_calls = _require_int(row["tool_calls"], f"{context}.tool_calls", minimum=0)
-
-    raw_events = row["routed_tool_events"]
-    if not isinstance(raw_events, list):
-        raise TypeError(f"{context}.routed_tool_events must be a list")
-    events = [
-        _require_mapping(event, f"{context}.routed_tool_events[{index}]")
-        for index, event in enumerate(raw_events)
-    ]
-    if len(events) != tool_calls:
-        raise ValueError(
-            f"{context}: len(routed_tool_events)={len(events)} != tool_calls={tool_calls}"
-        )
-
-    category_sequence: list[str] = []
-    for index, event in enumerate(events):
-        if "category" not in event:
-            raise ValueError(
-                f"{context}.routed_tool_events[{index}] is missing 'category'"
-            )
-        category = event["category"]
-        category_sequence.append(category if category in TOOL_ACTIONS else "INVALID")
-    pred_action = "NONE" if not category_sequence else category_sequence[0]
-    has_invalid_tool = "INVALID" in category_sequence
-    unique_categories = list(dict.fromkeys(category_sequence))
-    mixed_calls = len(unique_categories) > 1
-    outcome = _classify_outcome(
-        gold_action, pred_action, final_correct, has_invalid_tool
+    contract = validate_action_row(
+        row,
+        context=context,
+        require_pred_action=False,
+        strict_event_categories=False,
     )
+    gold_action = contract.gold_action
+    final_correct = contract.final_correct
+    tool_calls = contract.tool_calls
+    raw_events = row["routed_tool_events"]
+    events = contract.events
+    category_sequence = list(contract.category_sequence)
+    pred_action = contract.pred_action
+    has_invalid_tool = contract.invalid_tool_calls > 0
+    unique_categories = list(contract.unique_categories)
+    mixed_calls = contract.mixed_category_calls
+    outcome = contract.outcome
+    termination_reason = _require_nonempty_string(
+        row["termination_reason"], f"{context}.termination_reason"
+    )
+    if termination_reason not in {"boxed_answer", "max_rounds"}:
+        raise ValueError(
+            f"{context}.termination_reason must be boxed_answer or max_rounds, "
+            f"got {termination_reason!r}"
+        )
+    tool_parse_failures = _require_int(
+        row["tool_parse_failures"], f"{context}.tool_parse_failures", minimum=0
+    )
+    safety_rejections = 0
+    for index, event in enumerate(events):
+        if "result" not in event:
+            raise ValueError(
+                f"{context}.routed_tool_events[{index}] is missing 'result'; "
+                "formal safety diagnostics require the persisted tool result"
+            )
+        event_result = event["result"]
+        if not isinstance(event_result, Mapping):
+            raise TypeError(
+                f"{context}.routed_tool_events[{index}].result must be an object"
+            )
+        safety_rejections += int(_contains_safety_rejection(event_result))
 
     result: dict[str, Any] = {
         "source_file": str(source_path),
@@ -341,6 +362,10 @@ def _derive_row(
         "mixed_calls": mixed_calls,
         "mixed_category_calls": mixed_calls,
         "has_invalid_tool": has_invalid_tool,
+        "termination_reason": termination_reason,
+        "tool_parse_failures": tool_parse_failures,
+        "safety_rejection_count": safety_rejections,
+        "has_safety_rejection": safety_rejections > 0,
         "outcome": outcome,
         "routed_tool_events": json.dumps(
             raw_events, ensure_ascii=False, sort_keys=True
@@ -902,6 +927,213 @@ def build_multicall_tables(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     return pd.DataFrame(summary_rows), pd.DataFrame(by_gold_rows)
 
 
+def _tidy_group_summary(
+    frame: pd.DataFrame,
+    *,
+    group_columns: list[str],
+    metric_columns: list[str],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    grouped = frame.groupby(group_columns, sort=True, dropna=False)
+    for keys, group in grouped:
+        key_values = keys if isinstance(keys, tuple) else (keys,)
+        assert len(group_columns) == len(key_values)
+        base = dict(zip(group_columns, key_values))
+        for metric in metric_columns:
+            values = group[metric].dropna().astype(float).to_numpy()
+            rows.append(
+                {
+                    **base,
+                    "metric": metric,
+                    "n_runs": int(len(values)),
+                    "mean": float(values.mean()) if len(values) else math.nan,
+                    "population_sd": float(values.std(ddof=0))
+                    if len(values)
+                    else math.nan,
+                    "mean_pm_population_sd": (
+                        f"{values.mean():.6f} ± {values.std(ddof=0):.6f}"
+                        if len(values)
+                        else "undefined"
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_run_diagnostics(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Summarize formal termination, parse, and safety diagnostics per run."""
+
+    rows: list[dict[str, Any]] = []
+    for (setting, run_id, seed), group in frame.groupby(
+        ["setting", "run_id", "seed"], sort=True
+    ):
+        n_tasks = len(group)
+        boxed = group["termination_reason"] == "boxed_answer"
+        max_rounds = group["termination_reason"] == "max_rounds"
+        if int(boxed.sum() + max_rounds.sum()) != n_tasks:
+            raise AssertionError("Termination reasons do not partition a run")
+        parse_failures = group["tool_parse_failures"].to_numpy(dtype=int)
+        safety_rejections = group["safety_rejection_count"].to_numpy(dtype=int)
+        rows.append(
+            {
+                "setting": setting,
+                "run_id": run_id,
+                "seed": int(seed),
+                "n_tasks": n_tasks,
+                "boxed_answer_count": int(boxed.sum()),
+                "boxed_answer_rate": float(boxed.mean()),
+                "max_rounds_count": int(max_rounds.sum()),
+                "max_rounds_rate": float(max_rounds.mean()),
+                "rows_with_parse_failures_count": int((parse_failures > 0).sum()),
+                "rows_with_parse_failures_rate": float((parse_failures > 0).mean()),
+                "total_tool_parse_failures": int(parse_failures.sum()),
+                "avg_tool_parse_failures": float(parse_failures.mean()),
+                "rows_with_safety_rejection_count": int(
+                    (safety_rejections > 0).sum()
+                ),
+                "rows_with_safety_rejection_rate": float(
+                    (safety_rejections > 0).mean()
+                ),
+                "total_safety_rejections": int(safety_rejections.sum()),
+                "avg_safety_rejections": float(safety_rejections.mean()),
+            }
+        )
+    per_run = pd.DataFrame(rows)
+    metrics = [
+        column
+        for column in per_run.columns
+        if column not in {"setting", "run_id", "seed"}
+    ]
+    return per_run, _tidy_group_summary(
+        per_run, group_columns=["setting"], metric_columns=metrics
+    )
+
+
+def build_gold_action_final_accuracy(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return per-run and across-run final accuracy for each gold action."""
+
+    rows: list[dict[str, Any]] = []
+    for (setting, run_id, seed, gold_action), group in frame.groupby(
+        ["setting", "run_id", "seed", "gold_action"], sort=True
+    ):
+        rows.append(
+            {
+                "setting": setting,
+                "run_id": run_id,
+                "seed": int(seed),
+                "gold_action": gold_action,
+                "n_tasks": len(group),
+                "final_correct_count": int(group["final_correct"].sum()),
+                "final_accuracy": float(group["final_correct"].mean()),
+            }
+        )
+    per_run = pd.DataFrame(rows)
+    summary = _tidy_group_summary(
+        per_run,
+        group_columns=["setting", "gold_action"],
+        metric_columns=["final_accuracy"],
+    )
+    return per_run, summary
+
+
+def _setting_comparison_group(setting: str) -> tuple[str, str]:
+    if "no_reasoning" in setting or setting.startswith("probe_prefill_"):
+        reasoning = "no_reasoning"
+    elif "reasoning" in setting:
+        reasoning = "reasoning"
+    else:
+        reasoning = "unspecified"
+    if "fulltools" in setting:
+        scope = "fulltools"
+    elif "scoped" in setting:
+        scope = "scoped"
+    else:
+        scope = "unspecified"
+    return reasoning, scope
+
+
+def build_current_relative_tradeoff(
+    per_run: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pair every run to the matching current setting at the same seed."""
+
+    settings = sorted(str(value) for value in per_run["setting"].unique())
+    references: dict[tuple[str, str], str] = {}
+    for setting in settings:
+        if setting == "current" or setting.startswith("current_"):
+            group = _setting_comparison_group(setting)
+            if group in references:
+                raise ValueError(
+                    f"Multiple current references for comparison group {group}: "
+                    f"{references[group]!r}, {setting!r}"
+                )
+            references[group] = setting
+    rows: list[dict[str, Any]] = []
+    for setting in settings:
+        group = _setting_comparison_group(setting)
+        reference_setting = references.get(group)
+        if reference_setting is None:
+            raise ValueError(
+                f"No current reference setting for {setting!r} in group {group}"
+            )
+        target = per_run[per_run["setting"] == setting].set_index("seed")
+        reference = per_run[
+            per_run["setting"] == reference_setting
+        ].set_index("seed")
+        if not target.index.is_unique or not reference.index.is_unique:
+            raise ValueError("Current-relative comparison requires one run per setting/seed")
+        if set(target.index) != set(reference.index):
+            raise ValueError(
+                f"Seed panel differs for {setting!r} and {reference_setting!r}"
+            )
+        for seed in sorted(target.index):
+            target_row = target.loc[seed]
+            reference_row = reference.loc[seed]
+            current_calls = float(reference_row["total_tool_calls"])
+            setting_calls = float(target_row["total_tool_calls"])
+            calls_saved = current_calls - setting_calls
+            accuracy_loss = float(
+                reference_row["final_accuracy"] - target_row["final_accuracy"]
+            )
+            tc_reduction = (
+                calls_saved / current_calls if current_calls > 0 else math.nan
+            )
+            cost_per_saved_call = (
+                accuracy_loss / calls_saved if calls_saved > 0 else math.nan
+            )
+            rows.append(
+                {
+                    "setting": setting,
+                    "reference_setting": reference_setting,
+                    "comparison_group": "/".join(group),
+                    "seed": int(seed),
+                    "current_total_tool_calls": current_calls,
+                    "setting_total_tool_calls": setting_calls,
+                    "tool_calls_saved": calls_saved,
+                    "tc_reduction": tc_reduction,
+                    "current_final_accuracy": float(reference_row["final_accuracy"]),
+                    "setting_final_accuracy": float(target_row["final_accuracy"]),
+                    "accuracy_loss": accuracy_loss,
+                    "cost_per_saved_call": cost_per_saved_call,
+                    "cost_per_saved_call_defined": calls_saved > 0,
+                }
+            )
+    per_run_tradeoff = pd.DataFrame(rows)
+    summary = _tidy_group_summary(
+        per_run_tradeoff,
+        group_columns=["setting", "reference_setting", "comparison_group"],
+        metric_columns=[
+            "tool_calls_saved",
+            "tc_reduction",
+            "accuracy_loss",
+            "cost_per_saved_call",
+        ],
+    )
+    return per_run_tradeoff, summary
+
+
 def paired_bootstrap_comparisons(
     frame: pd.DataFrame,
     *,
@@ -929,6 +1161,7 @@ def paired_bootstrap_comparisons(
                 "n_task_ids",
                 "n_seeds",
                 "n_bootstrap",
+                "n_bootstrap_valid",
                 "bootstrap_seed",
             ]
         )
@@ -942,10 +1175,15 @@ def paired_bootstrap_comparisons(
     if len(reference) != len(complete_index):
         raise ValueError(f"Setting {settings[0]!r} is not a complete seed x ID panel")
 
-    # Shape: setting x metric x seed x task.  Shared bootstrap draws preserve
-    # exact pairing for every comparison and avoid redoing the expensive
-    # resampling separately for all O(n^2) setting pairs.
-    matrices = np.empty((len(settings), 3, len(seeds), len(ids)), dtype=np.float64)
+    # Shape: setting x feature x seed x task.  The first three features are
+    # linear outcomes; the remaining 20 are the fixed 4x5 gold/prediction
+    # contingency cells.  Shared draws preserve exact pairing across settings.
+    n_linear = 3
+    n_confusion = len(ACTIONS) * len(PREDICTIONS)
+    matrices = np.empty(
+        (len(settings), n_linear + n_confusion, len(seeds), len(ids)),
+        dtype=np.float64,
+    )
     reference_gold: np.ndarray | None = None
     for setting_index, setting in enumerate(settings):
         indexed = frame[frame["setting"] == setting].set_index(["seed", "id"])
@@ -976,9 +1214,121 @@ def paired_bootstrap_comparisons(
         matrices[setting_index, 2] = (
             indexed["tool_calls"].astype(float).to_numpy().reshape(len(seeds), len(ids))
         )
+        gold_grid = indexed["gold_action"].to_numpy(dtype=object).reshape(
+            len(seeds), len(ids)
+        )
+        pred_grid = indexed["pred_action"].to_numpy(dtype=object).reshape(
+            len(seeds), len(ids)
+        )
+        feature = n_linear
+        for gold_action in ACTIONS:
+            for pred_action in PREDICTIONS:
+                matrices[setting_index, feature] = (
+                    (gold_grid == gold_action) & (pred_grid == pred_action)
+                ).astype(float)
+                feature += 1
+
+    assert reference_gold is not None
+    reference_gold_grid = reference_gold.reshape(len(seeds), len(ids))
+    for seed_index, seed in enumerate(seeds):
+        missing = sorted(set(ACTIONS) - set(reference_gold_grid[seed_index]))
+        if missing:
+            raise ValueError(
+                "Paired bootstrap metrics require every gold action in every seed; "
+                f"seed {seed} is missing {missing}"
+            )
+
+    metric_index = {metric: index for index, metric in enumerate(BOOTSTRAP_METRICS)}
+
+    def derive_metrics(task_averages: np.ndarray) -> np.ndarray:
+        """Convert task-weighted features to per-seed registered metrics.
+
+        Input shape is batch x setting x feature x seed; output shape is
+        batch x setting x metric x seed.  A bootstrap draw that omits a gold
+        class yields NaN for its recall, balanced accuracy, and over-call rate,
+        never an implicit zero.
+        """
+
+        confusion = task_averages[:, :, n_linear:, :].reshape(
+            len(task_averages),
+            len(settings),
+            len(ACTIONS),
+            len(PREDICTIONS),
+            len(seeds),
+        )
+        row_totals = confusion.sum(axis=3)
+        true_positive = np.stack(
+            [confusion[:, :, index, index, :] for index in range(len(ACTIONS))],
+            axis=2,
+        )
+        recalls = np.full_like(true_positive, np.nan)
+        np.divide(
+            true_positive,
+            row_totals,
+            out=recalls,
+            where=row_totals > 0,
+        )
+        balanced = recalls.mean(axis=2)
+
+        f1_values: list[np.ndarray] = []
+        for action_index in range(len(ACTIONS)):
+            tp = true_positive[:, :, action_index, :]
+            fp = confusion[:, :, :, action_index, :].sum(axis=2) - tp
+            fn = row_totals[:, :, action_index, :] - tp
+            denominator = 2.0 * tp + fp + fn
+            score = np.zeros_like(tp)
+            np.divide(2.0 * tp, denominator, out=score, where=denominator > 0)
+            f1_values.append(score)
+        macro_f1 = np.stack(f1_values, axis=2).mean(axis=2)
+
+        tool_tp = confusion[:, :, 1:4, 1:5, :].sum(axis=(2, 3))
+        tool_fp = confusion[:, :, 0, 1:5, :].sum(axis=2)
+        tool_fn = confusion[:, :, 1:4, 0, :].sum(axis=2)
+        tool_denominator = 2.0 * tool_tp + tool_fp + tool_fn
+        toolneed_f1 = np.zeros_like(tool_tp)
+        np.divide(
+            2.0 * tool_tp,
+            tool_denominator,
+            out=toolneed_f1,
+            where=tool_denominator > 0,
+        )
+        overcall = np.full_like(tool_fp, np.nan)
+        np.divide(
+            tool_fp,
+            row_totals[:, :, 0, :],
+            out=overcall,
+            where=row_totals[:, :, 0, :] > 0,
+        )
+
+        values = np.empty(
+            (
+                len(task_averages),
+                len(settings),
+                len(BOOTSTRAP_METRICS),
+                len(seeds),
+            ),
+            dtype=np.float64,
+        )
+        values[:, :, metric_index["final_accuracy"], :] = task_averages[:, :, 0, :]
+        values[:, :, metric_index["action_accuracy"], :] = task_averages[:, :, 1, :]
+        values[:, :, metric_index["avg_tool_calls"], :] = task_averages[:, :, 2, :]
+        values[:, :, metric_index["total_tool_calls_per_run"], :] = (
+            task_averages[:, :, 2, :] * len(ids)
+        )
+        values[:, :, metric_index["balanced_accuracy"], :] = balanced
+        values[:, :, metric_index["macro_f1"], :] = macro_f1
+        values[:, :, metric_index["toolneed_f1"], :] = toolneed_f1
+        for action_index, action in enumerate(ACTIONS):
+            values[:, :, metric_index[f"recall_{action}"], :] = recalls[
+                :, :, action_index, :
+            ]
+        values[:, :, metric_index["overcall_rate"], :] = overcall
+        return values
 
     rng = np.random.default_rng(bootstrap_seed)
-    bootstrap_core = np.empty((n_bootstrap, len(settings), 3), dtype=np.float64)
+    bootstrap_metrics = np.empty(
+        (n_bootstrap, len(settings), len(BOOTSTRAP_METRICS)), dtype=np.float64
+    )
     batch_size = 128
     for start in range(0, n_bootstrap, batch_size):
         stop = min(start + batch_size, n_bootstrap)
@@ -999,35 +1349,40 @@ def paired_bootstrap_comparisons(
             (batch_rows_id, id_draws.ravel()),
             1.0 / len(ids),
         )
-        seed_averages = np.einsum(
-            "br,smri->bsmi", seed_weights, matrices, optimize=True
+        task_averages = np.einsum(
+            "sfri,bi->bsfr", matrices, id_weights, optimize=True
         )
-        bootstrap_core[start:stop] = np.einsum(
-            "bsmi,bi->bsm", seed_averages, id_weights, optimize=True
+        per_seed_metrics = derive_metrics(task_averages)
+        bootstrap_metrics[start:stop] = np.einsum(
+            "br,bsmr->bsm", seed_weights, per_seed_metrics, optimize=True
         )
 
-    point_core = matrices.mean(axis=(2, 3))
-    metric_index = {
-        "final_accuracy": 0,
-        "action_accuracy": 1,
-        "avg_tool_calls": 2,
-        "total_tool_calls_per_run": 2,
-    }
+    uniform_task_weights = np.full((1, len(ids)), 1.0 / len(ids))
+    point_task_averages = np.einsum(
+        "sfri,bi->bsfr", matrices, uniform_task_weights, optimize=True
+    )
+    point_per_seed = derive_metrics(point_task_averages)
+    point_metrics = point_per_seed.mean(axis=3)[0]
     rows: list[dict[str, Any]] = []
     for index_a, index_b in itertools.combinations(range(len(settings)), 2):
         setting_a = settings[index_a]
         setting_b = settings[index_b]
         for metric in BOOTSTRAP_METRICS:
-            core_index = metric_index[metric]
-            scale = len(ids) if metric == "total_tool_calls_per_run" else 1.0
+            index = metric_index[metric]
             point_delta = (
-                point_core[index_b, core_index] - point_core[index_a, core_index]
-            ) * scale
+                point_metrics[index_b, index] - point_metrics[index_a, index]
+            )
             bootstrap_delta = (
-                bootstrap_core[:, index_b, core_index]
-                - bootstrap_core[:, index_a, core_index]
-            ) * scale
-            low, high = np.quantile(bootstrap_delta, [0.025, 0.975])
+                bootstrap_metrics[:, index_b, index]
+                - bootstrap_metrics[:, index_a, index]
+            )
+            valid = np.isfinite(bootstrap_delta)
+            n_valid = int(valid.sum())
+            if not math.isfinite(float(point_delta)) or n_valid == 0:
+                raise ValueError(
+                    f"Paired bootstrap metric {metric} is undefined for the formal panel"
+                )
+            low, high = np.quantile(bootstrap_delta[valid], [0.025, 0.975])
             rows.append(
                 {
                     "setting_a": setting_a,
@@ -1039,104 +1394,182 @@ def paired_bootstrap_comparisons(
                     "n_task_ids": len(ids),
                     "n_seeds": len(seeds),
                     "n_bootstrap": n_bootstrap,
+                    "n_bootstrap_valid": n_valid,
                     "bootstrap_seed": bootstrap_seed,
                 }
             )
     return pd.DataFrame(rows)
 
 
-def load_label_distribution(path: Path | str) -> pd.DataFrame:
-    """Load strict label rows and tabulate difficulty x category x necessity."""
-
-    label_path = Path(path)
-    payload = _read_json(label_path)
-    if isinstance(payload, list):
-        raw_rows = payload
-    elif isinstance(payload, Mapping) and "rows" in payload:
-        raw_rows = payload["rows"]
-    else:
-        raise ValueError(
-            f"{label_path}: labels must be a row list or an object with 'rows'"
-        )
+def _load_strict_label_artifact(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    payload = _require_mapping(_read_json(path), f"Top level of {path}")
+    required_top = {
+        "schema_version",
+        "upstream_commit",
+        "model",
+        "split",
+        "seed",
+        "prompt_mode",
+        "reasoning_mode",
+        "tool_scope",
+        "n",
+        "rows",
+    }
+    missing_top = sorted(required_top - set(payload))
+    if missing_top:
+        raise ValueError(f"{path}: strict label artifact is missing {missing_top}")
+    expected_top = {
+        "schema_version": ACTION_SCHEMA_VERSION,
+        "upstream_commit": UPSTREAM_COMMIT,
+        "prompt_mode": "hard_no_tool",
+        "reasoning_mode": "no_reasoning",
+    }
+    for key, expected in expected_top.items():
+        if payload[key] != expected:
+            raise ValueError(f"{path}: {key}={payload[key]!r}, expected {expected!r}")
+    model = _require_nonempty_string(payload["model"], f"{path}.model")
+    split = _require_nonempty_string(payload["split"], f"{path}.split")
+    if split not in {"train", "test"}:
+        raise ValueError(f"{path}: split must be train or test, got {split!r}")
+    seed = _require_int(payload["seed"], f"{path}.seed")
+    tool_scope = _require_nonempty_string(payload["tool_scope"], f"{path}.tool_scope")
+    if tool_scope not in {"full", "scoped"}:
+        raise ValueError(f"{path}: invalid tool_scope {tool_scope!r}")
+    raw_rows = payload["rows"]
     if not isinstance(raw_rows, list) or not raw_rows:
-        raise ValueError(f"{label_path}: label rows must be a non-empty list")
+        raise ValueError(f"{path}: label rows must be a non-empty list")
+    if _require_int(payload["n"], f"{path}.n", minimum=1) != len(raw_rows):
+        raise ValueError(f"{path}: top-level n differs from len(rows)")
 
     rows: list[dict[str, Any]] = []
-    split_presence = []
-    id_presence = []
+    seen_ids: set[int] = set()
+    required_row = {
+        "id",
+        "split",
+        "difficulty",
+        "category",
+        "tool_necessary",
+        "gold_action",
+        "seed",
+        "prompt_mode",
+        "reasoning_mode",
+        "tool_scope",
+    }
     for index, raw_row in enumerate(raw_rows):
-        row = _require_mapping(raw_row, f"{label_path} rows[{index}]")
-        required = {"difficulty", "category", "tool_necessary"}
-        missing = sorted(required - set(row))
+        row = _require_mapping(raw_row, f"{path} rows[{index}]")
+        missing = sorted(required_row - set(row))
         if missing:
-            raise ValueError(f"{label_path} rows[{index}] is missing {missing}")
+            raise ValueError(f"{path} rows[{index}] is missing {missing}")
+        task_id = _require_int(row["id"], f"{path} rows[{index}].id")
+        if task_id in seen_ids:
+            raise ValueError(f"{path}: duplicate label ID {task_id} in split {split}")
+        seen_ids.add(task_id)
+        for key, expected in {
+            "split": split,
+            "seed": seed,
+            "prompt_mode": "hard_no_tool",
+            "reasoning_mode": "no_reasoning",
+            "tool_scope": tool_scope,
+        }.items():
+            if row[key] != expected:
+                raise ValueError(
+                    f"{path} rows[{index}].{key}={row[key]!r}, expected {expected!r}"
+                )
         difficulty = _require_nonempty_string(
-            row["difficulty"], f"{label_path} rows[{index}].difficulty"
+            row["difficulty"], f"{path} rows[{index}].difficulty"
         )
         category = row["category"]
         if category not in TOOL_ACTIONS:
             raise ValueError(
-                f"{label_path} rows[{index}].category must be one of {TOOL_ACTIONS}"
+                f"{path} rows[{index}].category must be one of {TOOL_ACTIONS}"
             )
         necessary = row["tool_necessary"]
-        if isinstance(necessary, bool):
-            necessary_int = int(necessary)
-        elif (
-            isinstance(necessary, int)
-            and not isinstance(necessary, bool)
-            and necessary in (0, 1)
-        ):
-            necessary_int = necessary
-        else:
+        if isinstance(necessary, bool) or not isinstance(necessary, int) or necessary not in (0, 1):
             raise TypeError(
-                f"{label_path} rows[{index}].tool_necessary must be boolean or 0/1"
+                f"{path} rows[{index}].tool_necessary must be integer 0 or 1"
             )
-        if "gold_action" in row:
-            expected = category if necessary_int else "NONE"
-            if row["gold_action"] != expected:
-                raise ValueError(
-                    f"{label_path} rows[{index}].gold_action={row['gold_action']!r}; expected {expected!r}"
-                )
-        result = {
-            "difficulty": difficulty,
-            "category": category,
-            "tool_necessary": necessary_int,
-        }
-        split_presence.append("split" in row)
-        if "split" in row:
-            result["split"] = _require_nonempty_string(
-                row["split"], f"{label_path} rows[{index}].split"
-            )
-        id_presence.append("id" in row)
-        if "id" in row:
-            result["id"] = _canonical_identifier(
-                row["id"], f"{label_path} rows[{index}].id"
-            )
-        rows.append(result)
-    if any(split_presence) and not all(split_presence):
-        raise ValueError(
-            f"{label_path}: split must be present on every label row or none"
-        )
-    if any(id_presence) and not all(id_presence):
-        raise ValueError(f"{label_path}: id must be present on every label row or none")
-
-    frame = pd.DataFrame(rows)
-    if all(id_presence):
-        duplicate_keys = ["id"] if not all(split_presence) else ["split", "id"]
-        if frame.duplicated(duplicate_keys).any():
+        expected_action = category if necessary else "NONE"
+        if row["gold_action"] != expected_action:
             raise ValueError(
-                f"{label_path}: duplicate label IDs for key {duplicate_keys}"
+                f"{path} rows[{index}].gold_action={row['gold_action']!r}; "
+                f"expected {expected_action!r}"
             )
-    group_prefix = ["split"] if all(split_presence) else []
-    group_columns = group_prefix + ["difficulty", "category", "tool_necessary"]
+        rows.append(
+            {
+                "source_file": str(path),
+                "id": task_id,
+                "split": split,
+                "difficulty": difficulty,
+                "category": category,
+                "tool_necessary": necessary,
+            }
+        )
+    metadata = {
+        "schema_version": payload["schema_version"],
+        "upstream_commit": payload["upstream_commit"],
+        "model": model,
+        "split": split,
+        "seed": seed,
+        "prompt_mode": payload["prompt_mode"],
+        "reasoning_mode": payload["reasoning_mode"],
+        "tool_scope": tool_scope,
+        "protocol_id": payload.get("protocol_id"),
+    }
+    return metadata, rows
+
+
+def load_label_distributions(paths: Sequence[Path | str]) -> pd.DataFrame:
+    """Combine strict split artifacts and retain split in every output cell."""
+
+    if not paths:
+        raise ValueError("At least one strict label artifact is required")
+    metadata: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    seen_splits: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        item, item_rows = _load_strict_label_artifact(path)
+        if item["split"] in seen_splits:
+            raise ValueError(f"Duplicate label artifact for split {item['split']!r}")
+        seen_splits.add(item["split"])
+        metadata.append(item)
+        rows.extend(item_rows)
+    invariant_keys = (
+        "schema_version",
+        "upstream_commit",
+        "model",
+        "seed",
+        "prompt_mode",
+        "reasoning_mode",
+        "tool_scope",
+        "protocol_id",
+    )
+    reference = metadata[0]
+    for item in metadata[1:]:
+        for key in invariant_keys:
+            if item[key] != reference[key]:
+                raise ValueError(
+                    f"Label artifacts disagree on {key}: "
+                    f"{reference[key]!r} != {item[key]!r}"
+                )
+    frame = pd.DataFrame(rows)
+    if frame.duplicated(["split", "id"]).any():
+        raise ValueError("Combined label artifacts contain duplicate (split, id)")
+    group_columns = ["split", "difficulty", "category", "tool_necessary"]
     counts = (
         frame.groupby(group_columns, sort=True).size().rename("count").reset_index()
     )
-    cell_columns = group_prefix + ["difficulty", "category"]
+    cell_columns = ["split", "difficulty", "category"]
     totals = counts.groupby(cell_columns, sort=True)["count"].transform("sum")
     counts["cell_total"] = totals
     counts["proportion_within_difficulty_category"] = counts["count"] / totals
     return counts
+
+
+def load_label_distribution(path: Path | str) -> pd.DataFrame:
+    """Backward-compatible strict single-artifact entry point."""
+
+    return load_label_distributions([path])
 
 
 def _plot_confusions(frame: pd.DataFrame, path: Path) -> None:
@@ -1286,7 +1719,7 @@ def _summary_payload(
     run_summary: pd.DataFrame,
     paired: pd.DataFrame,
     output_paths: Sequence[Path],
-    labels_path: Path | None,
+    label_paths: Sequence[Path],
     n_bootstrap: int,
     bootstrap_seed: int,
     expected_seeds: tuple[int, ...] | None,
@@ -1306,7 +1739,11 @@ def _summary_payload(
     return {
         "schema_version": SCHEMA_VERSION,
         "input_files": [str(path) for path in output_paths],
-        "labels_file": None if labels_path is None else str(labels_path),
+        "labels_file": str(label_paths[0]) if len(label_paths) == 1 else None,
+        "labels_files": [
+            {"path": str(path), "sha256": sha256_file(path)}
+            for path in label_paths
+        ],
         "n_rows": int(len(frame)),
         "n_task_ids": int(frame["id"].nunique()),
         "n_settings": int(frame["setting"].nunique()),
@@ -1354,6 +1791,7 @@ def collect_action_statistics(
     output_dir: Path | str,
     *,
     labels_path: Path | str | None = None,
+    labels_paths: Sequence[Path | str] | None = None,
     overwrite: bool = False,
     n_bootstrap: int = 10000,
     bootstrap_seed: int = 20260722,
@@ -1363,8 +1801,14 @@ def collect_action_statistics(
 
     normalized_inputs = [Path(path) for path in output_paths]
     destination = Path(output_dir)
-    normalized_labels = None if labels_path is None else Path(labels_path)
-    if destination in normalized_inputs or normalized_labels == destination:
+    if labels_path is not None and labels_paths is not None:
+        raise ValueError("Pass labels_path or labels_paths, not both")
+    normalized_labels = (
+        [Path(labels_path)]
+        if labels_path is not None
+        else [Path(path) for path in labels_paths or ()]
+    )
+    if destination in normalized_inputs or destination in normalized_labels:
         raise ValueError("Output directory must differ from every input path")
     if destination.exists() and not destination.is_dir():
         raise NotADirectoryError(
@@ -1389,13 +1833,16 @@ def collect_action_statistics(
     needed_category_analysis = build_needed_category_analysis(frame)
     none_analysis = build_none_analysis(frame)
     multicall_summary, multicall_by_gold = build_multicall_tables(frame)
+    run_diagnostics, run_diagnostic_summary = build_run_diagnostics(frame)
+    gold_final_per_run, gold_final_summary = build_gold_action_final_accuracy(frame)
+    tradeoff_per_run, tradeoff_summary = build_current_relative_tradeoff(per_run)
     paired = paired_bootstrap_comparisons(
         frame, n_bootstrap=n_bootstrap, bootstrap_seed=bootstrap_seed
     )
     label_distribution = (
         None
-        if normalized_labels is None
-        else load_label_distribution(normalized_labels)
+        if not normalized_labels
+        else load_label_distributions(normalized_labels)
     )
     _prepare_output_directory(destination, overwrite)
 
@@ -1413,6 +1860,12 @@ def collect_action_statistics(
         "none_analysis.csv": none_analysis,
         "multicall_summary.csv": multicall_summary,
         "multicall_by_gold.csv": multicall_by_gold,
+        "run_diagnostics.csv": run_diagnostics,
+        "run_diagnostic_summary.csv": run_diagnostic_summary,
+        "gold_action_final_accuracy_per_run.csv": gold_final_per_run,
+        "gold_action_final_accuracy_summary.csv": gold_final_summary,
+        "current_relative_tradeoff_per_run.csv": tradeoff_per_run,
+        "current_relative_tradeoff_summary.csv": tradeoff_summary,
         "paired_bootstrap_comparisons.csv": paired,
     }
     if label_distribution is not None:

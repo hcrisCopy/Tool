@@ -24,8 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--labels",
         type=Path,
+        nargs="+",
         default=None,
-        help="Optional hard-no-tool label JSON for difficulty/category/necessity counts.",
+        help=(
+            "Optional strict hard-no-tool label artifacts, typically train then "
+            "test, for split-preserving difficulty/category/necessity counts."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--bootstrap-samples", type=int, default=10000)
@@ -53,7 +57,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     summary = collect_action_statistics(
         args.outputs,
         args.output_dir,
-        labels_path=args.labels,
+        labels_paths=args.labels,
         overwrite=args.overwrite,
         n_bootstrap=args.bootstrap_samples,
         bootstrap_seed=args.bootstrap_seed,

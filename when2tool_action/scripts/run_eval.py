@@ -7,7 +7,17 @@ from pathlib import Path
 from when2tool_action.config import load_config, require_inputs
 from when2tool_action.constants import SCHEMA_VERSION, UPSTREAM_COMMIT
 from when2tool_action.data import load_task_json, smoke_subset
-from when2tool_action.io_utils import atomic_write_json, canonical_json_sha256
+from when2tool_action.eval_resume import (
+    initialize_evaluation_artifacts,
+    prepare_evaluation_artifact,
+    validate_evaluation_artifact_for_resume,
+)
+from when2tool_action.io_utils import (
+    atomic_write_json,
+    canonical_json_sha256,
+    sha256_file,
+)
+from when2tool_action.provenance import validate_runtime_provenance
 from when2tool_action.runtime import (
     EvaluationSetting,
     attach_gold_actions,
@@ -44,18 +54,21 @@ def main() -> None:
     parser.add_argument("--record-mode", choices=["off", "lite", "full"], default="lite")
     parser.add_argument("--seeds", nargs="*", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
+    output_policy = parser.add_mutually_exclusive_group()
+    output_policy.add_argument("--overwrite", action="store_true")
+    output_policy.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     config = load_config(args.config)
     require_inputs(config)
+    runtime_provenance = validate_runtime_provenance(config)
+    data_path = Path(args.data).resolve()
+    labels_path = Path(args.labels).resolve()
     output_path = Path(args.output).resolve()
-    if output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"Refusing to overwrite {output_path}")
-    tasks = load_task_json(Path(args.data).resolve(), expected_scope=args.tool_scope)
+    tasks = load_task_json(data_path, expected_scope=args.tool_scope)
     if args.smoke:
         tasks = smoke_subset(tasks)
-    label_rows = _load_labels(Path(args.labels).resolve())
+    label_rows = _load_labels(labels_path)
     selected_ids = {task["id"] for task in tasks}
     label_rows = [row for row in label_rows if row.get("id") in selected_ids]
     tasks = attach_gold_actions(tasks, label_rows)
@@ -69,11 +82,20 @@ def main() -> None:
         require_reasoning=args.reasoning_mode == "reasoning",
         record_mode=args.record_mode,
     )
-    artifact = {
+    task_ids = [task["id"] for task in tasks]
+    expected_row_fields = {
+        task["id"]: {"gold_action": task["gold_action"]} for task in tasks
+    }
+    artifact_template = {
         "schema_version": SCHEMA_VERSION,
         "upstream_commit": UPSTREAM_COMMIT,
         "config": {
             "model": config.model.slug,
+            "config_sha256": sha256_file(config.source),
+            "data_sha256": sha256_file(data_path),
+            "labels_sha256": sha256_file(labels_path),
+            "runtime_provenance_sha256": runtime_provenance["sha256"],
+            "project_git_commit": runtime_provenance["git_commit"],
             "setting": setting.name,
             "tool_scope": setting.tool_scope,
             "prompt_mode": setting.prompt_mode,
@@ -88,13 +110,27 @@ def main() -> None:
             "max_rounds": config.generation.max_rounds,
             "max_model_len": config.generation.max_model_len,
             "full_menu_sha256": full_menu_sha256(),
-            "task_ids_sha256": canonical_json_sha256([task["id"] for task in tasks]),
+            "task_ids_sha256": canonical_json_sha256(task_ids),
             "smoke": args.smoke,
         },
         "runs": [],
     }
+    prepared = prepare_evaluation_artifact(
+        output_path,
+        template=artifact_template,
+        task_ids=task_ids,
+        overwrite=args.overwrite,
+        resume=args.resume,
+        expected_row_fields=expected_row_fields,
+    )
+    initialize_evaluation_artifacts([prepared])
+    artifact = prepared.artifact
+    if prepared.completed_runs == len(seeds):
+        print(f"Evaluation already complete and validated: {output_path}", flush=True)
+        return
     agent = build_agent(config)
-    for run_index, seed in enumerate(seeds):
+    for run_index in range(prepared.completed_runs, len(seeds)):
+        seed = seeds[run_index]
         set_generation_seed(agent, seed, config.generation.repetition_penalty)
         run_id = f"run_{run_index}_seed_{seed}"
         rows = evaluate(
@@ -113,6 +149,12 @@ def main() -> None:
                 "setting": setting.name,
                 "rows": rows,
             }
+        )
+        validate_evaluation_artifact_for_resume(
+            artifact,
+            template=artifact_template,
+            task_ids=task_ids,
+            expected_row_fields=expected_row_fields,
         )
         atomic_write_json(output_path, artifact, overwrite=True)
         print(f"Checkpointed {run_id} to {output_path}", flush=True)

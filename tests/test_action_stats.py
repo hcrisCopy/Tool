@@ -4,10 +4,16 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from when2tool_action.constants import SCHEMA_VERSION as ACTION_SCHEMA_VERSION
+from when2tool_action.constants import UPSTREAM_COMMIT
 from when2tool_action.stats import (
+    BOOTSTRAP_METRICS,
+    build_current_relative_tradeoff,
+    build_gold_action_final_accuracy,
     build_multicall_tables,
     build_needed_category_analysis,
     build_none_analysis,
+    build_run_diagnostics,
     collect_action_statistics,
     compute_per_run_metrics,
     load_evaluation_outputs,
@@ -31,9 +37,17 @@ def _row(
         "seed": seed,
         "setting": setting,
         "gold_action": gold,
-        "routed_tool_events": [{"category": category} for category in categories],
+        "routed_tool_events": [
+            {
+                "category": category,
+                "result": {"success": category != "unknown"},
+            }
+            for category in categories
+        ],
         "tool_calls": len(categories),
         "final_correct": correct,
+        "termination_reason": "boxed_answer",
+        "tool_parse_failures": 0,
     }
 
 
@@ -51,6 +65,38 @@ def _payload(setting: str, outcomes: list[tuple[str, list[str], bool]]) -> dict:
 
 def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _label_artifact(
+    split: str, entries: list[tuple[int, str, int]]
+) -> dict:
+    rows = [
+        {
+            "id": task_id,
+            "split": split,
+            "difficulty": "easy",
+            "category": category,
+            "tool_necessary": necessary,
+            "gold_action": category if necessary else "NONE",
+            "seed": 0,
+            "prompt_mode": "hard_no_tool",
+            "reasoning_mode": "no_reasoning",
+            "tool_scope": "full",
+        }
+        for task_id, category, necessary in entries
+    ]
+    return {
+        "schema_version": ACTION_SCHEMA_VERSION,
+        "upstream_commit": UPSTREAM_COMMIT,
+        "model": "model-slug",
+        "split": split,
+        "seed": 0,
+        "prompt_mode": "hard_no_tool",
+        "reasoning_mode": "no_reasoning",
+        "tool_scope": "full",
+        "n": len(rows),
+        "rows": rows,
+    }
 
 
 def test_derives_actions_sequences_hierarchy_and_metrics(tmp_path: Path) -> None:
@@ -235,6 +281,60 @@ def test_rejects_call_count_mismatch_and_duplicate_keys(tmp_path: Path) -> None:
         load_evaluation_outputs([duplicate])
 
 
+def test_formal_diagnostics_and_gold_action_accuracy(tmp_path: Path) -> None:
+    path = tmp_path / "formal.json"
+    payload = _payload(
+        "current",
+        [
+            ("NONE", [], True),
+            ("A", ["A"], False),
+            ("B", ["B"], True),
+            ("C", ["C"], True),
+        ],
+    )
+    for run in payload["runs"]:
+        run["rows"][1]["termination_reason"] = "max_rounds"
+        run["rows"][1]["tool_parse_failures"] = 2
+        run["rows"][1]["routed_tool_events"][0]["result"] = {
+            "success": False,
+            "message": "[SAFETY_REJECTED] test guard",
+        }
+    _write(path, payload)
+    frame = load_evaluation_outputs([path])
+    diagnostics, diagnostic_summary = build_run_diagnostics(frame)
+    row = diagnostics.iloc[0]
+    assert row["max_rounds_count"] == 1
+    assert row["total_tool_parse_failures"] == 2
+    assert row["rows_with_safety_rejection_count"] == 1
+    assert row["total_safety_rejections"] == 1
+    assert set(diagnostic_summary["n_runs"]) == {2}
+
+    per_run, summary = build_gold_action_final_accuracy(frame)
+    action_a = per_run[per_run["gold_action"] == "A"]
+    assert set(action_a["final_accuracy"]) == {0.0}
+    action_a_summary = summary[
+        (summary["gold_action"] == "A") & (summary["metric"] == "final_accuracy")
+    ].iloc[0]
+    assert action_a_summary["mean"] == pytest.approx(0.0)
+    assert action_a_summary["population_sd"] == pytest.approx(0.0)
+
+
+def test_formal_schema_rejects_missing_diagnostic_evidence(tmp_path: Path) -> None:
+    missing_termination = tmp_path / "missing_termination.json"
+    payload = _payload("current", [("A", ["A"], True)])
+    del payload["runs"][0]["rows"][0]["termination_reason"]
+    _write(missing_termination, payload)
+    with pytest.raises(ValueError, match="termination_reason"):
+        load_evaluation_outputs([missing_termination])
+
+    missing_result = tmp_path / "missing_result.json"
+    payload = _payload("current", [("A", ["A"], True)])
+    del payload["runs"][0]["rows"][0]["routed_tool_events"][0]["result"]
+    _write(missing_result, payload)
+    with pytest.raises(ValueError, match="formal safety diagnostics"):
+        load_evaluation_outputs([missing_result])
+
+
 def test_requires_identical_id_sets_across_runs(tmp_path: Path) -> None:
     path = tmp_path / "ids.json"
     payload = _payload("current", [("NONE", [], True), ("A", ["A"], True)])
@@ -311,19 +411,95 @@ def test_paired_bootstrap_is_deterministic_and_signed(tmp_path: Path) -> None:
     first = paired_bootstrap_comparisons(frame, n_bootstrap=100, bootstrap_seed=7)
     second = paired_bootstrap_comparisons(frame, n_bootstrap=100, bootstrap_seed=7)
     pd.testing.assert_frame_equal(first, second)
-    final = first[first["metric"] == "final_accuracy"].iloc[0]
-    action = first[first["metric"] == "action_accuracy"].iloc[0]
-    assert final["setting_a"] == "a"
-    assert final["setting_b"] == "b"
-    assert final["delta_b_minus_a"] == pytest.approx(1.0)
-    assert action["delta_b_minus_a"] == pytest.approx(1.0)
+    assert set(first["metric"]) == set(BOOTSTRAP_METRICS)
+    expected_deltas = {
+        "final_accuracy": 1.0,
+        "action_accuracy": 1.0,
+        "avg_tool_calls": 0.25,
+        "total_tool_calls_per_run": 1.0,
+        "balanced_accuracy": 1.0,
+        "macro_f1": 1.0,
+        "toolneed_f1": 0.6,
+        "recall_NONE": 1.0,
+        "recall_A": 1.0,
+        "recall_B": 1.0,
+        "recall_C": 1.0,
+        "overcall_rate": -1.0,
+    }
+    for metric, expected in expected_deltas.items():
+        row = first[first["metric"] == metric].iloc[0]
+        assert row["setting_a"] == "a"
+        assert row["setting_b"] == "b"
+        assert row["delta_b_minus_a"] == pytest.approx(expected)
+        assert 0 < row["n_bootstrap_valid"] <= 100
+
+    clone = frame[frame["setting"] == "a"].copy()
+    clone["setting"] = "clone_of_a"
+    paired = paired_bootstrap_comparisons(
+        pd.concat([frame, clone], ignore_index=True),
+        n_bootstrap=100,
+        bootstrap_seed=7,
+    )
+    identical = paired[
+        (paired["setting_a"] == "a") & (paired["setting_b"] == "clone_of_a")
+    ]
+    assert len(identical) == len(BOOTSTRAP_METRICS)
+    assert (identical[["delta_b_minus_a", "ci95_low", "ci95_high"]] == 0.0).all().all()
+
+
+def test_current_relative_tradeoff_is_seed_paired(tmp_path: Path) -> None:
+    current_path = tmp_path / "current.json"
+    sparse_path = tmp_path / "sparse.json"
+    _write(
+        current_path,
+        _payload(
+            "current_no_reasoning_fulltools",
+            [
+                ("NONE", ["A"], True),
+                ("A", ["A", "A"], True),
+                ("B", ["B"], True),
+                ("C", ["C"], True),
+            ],
+        ),
+    )
+    _write(
+        sparse_path,
+        _payload(
+            "sparse_tool_no_reasoning_fulltools",
+            [
+                ("NONE", [], True),
+                ("A", ["A"], False),
+                ("B", ["B"], True),
+                ("C", [], False),
+            ],
+        ),
+    )
+    frame = load_evaluation_outputs([current_path, sparse_path])
+    per_run = compute_per_run_metrics(frame)
+    tradeoff, summary = build_current_relative_tradeoff(per_run)
+    sparse = tradeoff[
+        tradeoff["setting"] == "sparse_tool_no_reasoning_fulltools"
+    ]
+    assert len(sparse) == 2
+    assert set(sparse["reference_setting"]) == {"current_no_reasoning_fulltools"}
+    assert set(sparse["tool_calls_saved"]) == {3.0}
+    assert set(sparse["tc_reduction"]) == {0.6}
+    assert set(sparse["accuracy_loss"]) == {0.5}
+    assert sparse["cost_per_saved_call"].tolist() == pytest.approx([1 / 6, 1 / 6])
+    reduction = summary[
+        (summary["setting"] == "sparse_tool_no_reasoning_fulltools")
+        & (summary["metric"] == "tc_reduction")
+    ].iloc[0]
+    assert reduction["mean"] == pytest.approx(0.6)
+    assert reduction["population_sd"] == pytest.approx(0.0)
 
 
 def test_full_collection_writes_tables_plots_and_label_distribution(
     tmp_path: Path,
 ) -> None:
     outputs = tmp_path / "outputs.json"
-    labels = tmp_path / "labels.json"
+    train_labels = tmp_path / "train_labels.json"
+    test_labels = tmp_path / "test_labels.json"
     output_dir = tmp_path / "stats"
     _write(
         outputs,
@@ -337,23 +513,21 @@ def test_full_collection_writes_tables_plots_and_label_distribution(
             ],
         ),
     )
-    labels.write_text(
+    train_labels.write_text(
         json.dumps(
-            {
-                "rows": [
-                    {
-                        "id": index,
-                        "split": "test",
-                        "difficulty": "easy",
-                        "category": category,
-                        "tool_necessary": necessary,
-                        "gold_action": category if necessary else "NONE",
-                    }
-                    for index, (category, necessary) in enumerate(
-                        [("A", 0), ("A", 1), ("B", 1), ("C", 0)]
-                    )
-                ]
-            }
+            _label_artifact(
+                "train",
+                [(100, "A", 0), (101, "A", 1), (102, "B", 1), (103, "C", 0)],
+            )
+        ),
+        encoding="utf-8",
+    )
+    test_labels.write_text(
+        json.dumps(
+            _label_artifact(
+                "test",
+                [(0, "A", 0), (1, "A", 1), (2, "B", 1), (3, "C", 0)],
+            )
         ),
         encoding="utf-8",
     )
@@ -361,7 +535,7 @@ def test_full_collection_writes_tables_plots_and_label_distribution(
     summary = collect_action_statistics(
         [outputs],
         output_dir,
-        labels_path=labels,
+        labels_paths=[train_labels, test_labels],
         n_bootstrap=20,
         bootstrap_seed=3,
         expected_seeds=(0, 1),
@@ -385,12 +559,25 @@ def test_full_collection_writes_tables_plots_and_label_distribution(
         "multicall_by_gold.csv",
         "paired_bootstrap_comparisons.csv",
         "label_distribution.csv",
+        "run_diagnostics.csv",
+        "run_diagnostic_summary.csv",
+        "gold_action_final_accuracy_per_run.csv",
+        "gold_action_final_accuracy_summary.csv",
+        "current_relative_tradeoff_per_run.csv",
+        "current_relative_tradeoff_summary.csv",
         "confusion_heatmap.png",
         "recall_bars.png",
         "error_stacked.png",
         "accuracy_vs_total_tc.png",
     }
     assert expected <= {path.name for path in output_dir.iterdir()}
+    assert [item["path"] for item in summary["labels_files"]] == [
+        str(train_labels),
+        str(test_labels),
+    ]
+    assert all(len(item["sha256"]) == 64 for item in summary["labels_files"])
+    distribution = pd.read_csv(output_dir / "label_distribution.csv")
+    assert set(distribution["split"]) == {"train", "test"}
     assert summary["metric_definitions"]["no_call_precision"] == (
         "P(gold NONE | predicted NONE)."
     )
