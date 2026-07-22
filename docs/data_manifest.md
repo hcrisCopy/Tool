@@ -18,6 +18,11 @@
         ├── probes/{fulltools,scoped,scoped_original_w2t}/
         ├── outputs/{fulltools,scoped_adapted,scoped_original_w2t}/
         ├── analysis/{fulltools,scoped_adapted,scoped_original_w2t}/
+        ├── stages/
+        │   ├── 05_probing/{activations,discovery,logs,manifests}/
+        │   ├── 06_causal/{conditions,metrics,figures,logs,manifests}/
+        │   ├── 07_training/{sft,adapters,logs,manifests}/
+        │   └── 08_evaluation/{outputs,metrics,figures,manifests}/
         ├── logs/
         └── reports/
 
@@ -55,6 +60,19 @@ When2Tool 当前四个 parquet 的上游 LFS SHA256：
 - `tasks_v1_test_fulltools_category.json`：2250 条，同上。
 
 固定完整菜单包含 15 个环境、33 个全局唯一原名工具，SHA256 为 `9fe32b5541d03e6948982b1669fb0d289325f0124ef204d159c239487766f117`。
+
+## 第 5 阶段以后的大型产物
+
+Qwen3-4B-Instruct-2507 固定为 36 个 decoder blocks、hidden size 2560、SwiGLU intermediate size 9728。第 5 阶段的 neuron 定义为 `SiLU(gate_proj(x)) * up_proj(x)` 的一个 intermediate component，不是现有 `(37, 2560)` residual hidden component。
+
+| 阶段 | 数据侧目录 | 主要产物 | 必需 provenance |
+|---|---|---|---|
+| 05 probing | `stages/05_probing` | train/test float16 activation、9 组 neuron mask/CSV/PNG、冻结 probe metrics | task/label/model/config SHA、shape/dtype、prompt/menu SHA、selection split、control IDs |
+| 06 causal | `stages/06_causal` | 25 个完整条件的逐样本轨迹、condition metrics、recall-drop 图 | mask SHA、HF backend config、target/random indices、generation seed、完成状态 |
+| 07 training | `stages/07_training` | SFT JSONL、过滤清单、target/random/dense adapter、trainer state | source trajectory SHA、retained/dropped 分布、mask snapshot、全部训练超参、raw/effective parameter count |
+| 08 evaluation | `stages/08_evaluation` | scoped/full 三种子轨迹、统计表和 Pareto 图 | frozen label SHA、adapter/base SHA、scope、generation config、seed |
+
+以 float16 保存完整 train/test MLP activation 约需要 2 GiB 量级，逐样本因果轨迹和 adapter 还会继续增长；这些文件不得复制进 Git。每个 stage 的 manifest 必须能从输入 SHA、mask indices 和冻结参数重建实验，不允许只依赖日志文件名。
 
 ## 原始 scoped probe 的迁移边界
 

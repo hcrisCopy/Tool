@@ -23,6 +23,13 @@ htmlcov/
 /checkpoints/
 /cache/
 /visualizations/
+/stages/
+/activations/
+/neuron_masks/
+/neuron_tables/
+/ablations/
+/sft_data/
+/adapters/
 *.log
 
 # Large tensors, datasets, and checkpoints must never enter Git.

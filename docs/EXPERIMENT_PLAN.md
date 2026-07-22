@@ -1,5 +1,7 @@
 # When2Tool + Precise Shield 实验方案
 
+> 实现冻结说明（2026-07-22）：第 5-8 阶段的权威运行矩阵和命令见 [STAGE5_PLUS_HANDOFF.md](STAGE5_PLUS_HANDOFF.md)。为避免 test leakage，主 mask 在因果结果之前预注册为 `rho=0.003 + signed`，不再按 test 因果结果从 9 组中择优；random 与 dense LoRA 均作为正式对照，所有因果/训练后 base 条件与处理组统一使用 HF backend。这些收紧不改变原方案的核心假设。
+
 > 这是用户冻结的新方案原文的可交接副本，仅移除了个人电脑文件路径。它是设计依据，不是可直接复制命令的执行手册；文中后续章节的草案文件名可能与最终实现不同。当前阶段实际入口、执行契约、已发现的必要修正（例如标签 12 轮、行为 10 轮）及结果以根 README、`scripts/run_statistics_stage.sh`、代码测试和阶段报告为准；尚未完成的 MLP 神经元、因果 mask 与 LoRA 章节仍是后续计划。
 
 ## 0. 目标和边界

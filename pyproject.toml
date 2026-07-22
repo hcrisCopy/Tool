@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "when2tool-action"
-version = "0.2.0"
+version = "0.3.0"
 description = "Full-menu NONE/A/B/C action analysis and Precise-Shield-style tool-neuron experiments"
 requires-python = ">=3.11,<3.12"
 

@@ -38,6 +38,14 @@ def _load_labels(path: Path) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--runtime-provenance",
+        default=None,
+        help=(
+            "Optional stage-specific runtime provenance receipt. When omitted, "
+            "the legacy run-root manifest is used."
+        ),
+    )
     parser.add_argument("--data", required=True)
     parser.add_argument("--labels", required=True)
     parser.add_argument("--output", required=True)
@@ -61,7 +69,13 @@ def main() -> None:
 
     config = load_config(args.config)
     require_inputs(config)
-    runtime_provenance = validate_runtime_provenance(config)
+    runtime_provenance = (
+        validate_runtime_provenance(
+            config, Path(args.runtime_provenance).resolve()
+        )
+        if args.runtime_provenance is not None
+        else validate_runtime_provenance(config)
+    )
     data_path = Path(args.data).resolve()
     labels_path = Path(args.labels).resolve()
     output_path = Path(args.output).resolve()

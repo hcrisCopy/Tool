@@ -27,6 +27,11 @@ CallTool_data/
         │   ├── scoped_adapted/              # adapted scoped 统计与图表（待生成）
         │   └── scoped_original_w2t/         # original-W2T 统计与图表（待生成）
         ├── manifests/                       # runtime provenance、formal audit、handoff
+        ├── stages/
+        │   ├── 05_probing/                 # MLP activation、9 组 mask/probe、图和日志
+        │   ├── 06_causal/                  # 25 条件 target/random mask 轨迹与汇总
+        │   ├── 07_training/                # SFT 审计与 target/dense/random adapters
+        │   └── 08_evaluation/              # scoped/full 评测、横向表与 Pareto 图
         ├── logs/
         │   ├── setup/                       # 环境安装记录
         │   ├── labels/                      # 标签生成日志
@@ -43,5 +48,16 @@ CallTool_data/
 - `reports/STAGE_STATISTICS_QWEN3_4B.md` 是 Git 阶段报告的普通文件副本，当前记录 partial checkpoint；
 - `analysis/{fulltools,scoped_adapted,scoped_original_w2t}/` 保存统计 CSV、JSON 与关键 PNG；
 - `logs/{setup,labels,hidden,probes,behavior}/` 只用于诊断，不在 stage handoff 的哈希范围内。
+
+第 5-8 阶段分别维护自己的 `manifests/runtime_provenance.json`，不覆盖旧统计阶段的全局 receipt。正式阶段布局与最小成功产物：
+
+| 阶段 | 入口 | 最小完整产物 |
+|---|---|---|
+| 05 | `../CallTool_code/scripts/run_stage5_probing.sh` | 两个 activation manifest、9 个 discovery 目录 |
+| 06 | `../CallTool_code/scripts/run_stage6_causal.sh` | 25 条件 seed-0 checkpoints、`summary.json` |
+| 07 | `../CallTool_code/scripts/run_stage7_training.sh` | SFT manifest、5 个 adapter `train_manifest.json` |
+| 08 | `../CallTool_code/scripts/run_stage8_evaluation.sh` | 12 格三 seeds、`comparison_summary.json` |
+
+阶段脚本会校验并记录 receipt SHA、生成 commit、数据/标签/mask SHA。不要手工改 adapter 名称、移动单个 checkpoint 后继续跑，或为训练后模型重新生成 gold labels。
 
 不要把这些文件复制进 Git 仓库，也不要用缓存中的同名模型或数据覆盖现有快照。资源来源、revision 与已知 SHA 见 `../CallTool_code/docs/data_manifest.md`。

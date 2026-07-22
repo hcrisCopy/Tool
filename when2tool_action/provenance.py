@@ -25,8 +25,10 @@ MODEL_IDENTITY_SUFFIXES = {
     ".txt",
 }
 RUNTIME_PACKAGES = (
+    "accelerate",
     "numpy",
     "pandas",
+    "peft",
     "pyyaml",
     "scikit-learn",
     "torch",

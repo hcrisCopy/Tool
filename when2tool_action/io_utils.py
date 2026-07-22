@@ -25,7 +25,11 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 def canonical_json_sha256(value: Any) -> str:
     payload = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return sha256_bytes(payload)
 
@@ -46,7 +50,13 @@ def _require_new(path: Path, overwrite: bool) -> None:
 def atomic_write_json(path: Path, value: Any, *, overwrite: bool = False) -> None:
     _require_new(path, overwrite)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    ) + "\n"
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=path.parent, delete=False
     ) as handle:
