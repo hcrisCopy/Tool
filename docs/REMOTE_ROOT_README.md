@@ -11,7 +11,7 @@ CallTool/
 
 共享基础模型不在项目内重复保存，固定从本目录的同级路径 `../Qwen/Qwen3-4B-Instruct-2507/` 读取。
 
-当前 Qwen3-4B-Instruct-2507 single-hop 已完成数据改造、冻结模型相关标签以及 full/scoped residual probes。第 5 阶段以后代码现已交付：FFN intermediate `(layer, neuron_idx)` 的 9 组探测、25 条件因果 mask、target/dense/random masked-LoRA，以及 scoped/full 训练后评测。第 5 阶段实跑状态见阶段交接文档；第 6-8 阶段仅准备代码和冻结矩阵，不应在未检查因果门槛时直接训练。
+当前 Qwen3-4B-Instruct-2507 single-hop 已完成数据改造、冻结模型相关标签、full/scoped residual probes，以及第 5 阶段 FFN intermediate `(layer, neuron_idx)` 的正式探测。Stage 5 的 9/9 组均完整；预注册 `.003_signed` primary 的 binary Accuracy/Balanced Accuracy/Macro-F1/AUROC 为 `.8018/.7923/.7917/.8827`，四动作为 `.6031/.3365/.3101/.9349`。这对 H1 是有限但明确的支持，不是因果证据。第 6-8 阶段的 25 条件因果 mask、target/dense/random masked-LoRA 与 scoped/full 评测代码已准备，但尚未正式运行；未检查因果门槛前不得直接训练。
 
 权威入口：
 
@@ -22,6 +22,7 @@ CallTool/
 - 大文件清单：`CallTool_code/docs/data_manifest.md`
 - 数据目录说明：`CallTool_data/README.md`
 - 生成 provenance：`CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507/manifests/runtime_provenance.json`
+- Stage 5 provenance：`CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507/stages/05_probing/manifests/runtime_provenance.json`，SHA256 `0a78f15d5327f90038792213da5a7798896d0e79532ee47d6e4b44541d12ed24`
 
 旧统计行为面板仍是 partial checkpoint；它不阻塞以冻结 labels 开展 FFN 探测，但最终与 Prompt-only/Probe&Prefill 的完整论文比较仍需补齐。不要把旧统计的全局 runtime receipt 覆盖为新代码提交；第 5-8 阶段各自使用 `stages/<stage>/manifests/runtime_provenance.json`。
 
@@ -34,12 +35,12 @@ python -m pip check
 python -m pytest -q
 ```
 
-Git clone 只包含代码，不能代替 `CallTool_data/` 与共享模型快照。当前 partial 交付先核对 runtime provenance、各产物 manifest/receipt 与阶段报告列出的行为 SHA；完整阶段结束后再按 `stage_handoff.json` 逐文件验证。不要重新创建已经清理的旧 `experiments_2d` 方案树。
+Git clone 只包含代码，不能代替 `CallTool_data/` 与共享模型快照。“partial”仅指旧统计行为/P&P 面板；第 5 阶段本身已经独立完整。恢复时先核对各自 runtime provenance、产物 manifest/receipt 与阶段报告列出的 SHA；旧行为完整面板结束后再按 `stage_handoff.json` 逐文件验证。不要重新创建已经清理的旧 `experiments_2d` 方案树。
 
-第 5-8 阶段的一键入口依次为：
+第 5 阶段命令仅用于在新的输出 `RUN_ROOT` 复现；当前正式目录已有产物时不得直接重跑。`INPUT_RUN_ROOT` 默认仍指向正式根并只读取其中的 `data/`、`labels/`，所以新输出根不需要复制输入。第 6-8 阶段的一键入口依次为：
 
 ```bash
-bash scripts/run_stage5_probing.sh
+RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica bash scripts/run_stage5_probing.sh
 bash scripts/run_stage6_causal.sh
 STAGE_START=source bash scripts/run_stage7_training.sh
 CAUSAL_GATE_PASSED=1 STAGE_START=training NPROC_PER_NODE=8 bash scripts/run_stage7_training.sh

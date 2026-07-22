@@ -8,9 +8,10 @@ cd "${CODE_ROOT}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CONFIG="${CONFIG:-when2tool_action/configs/qwen3_4b_instruct_2507.yaml}"
 MODEL="qwen3-4b-instruct-2507"
-RUN_ROOT="${RUN_ROOT:-../CallTool_data/when2tool_precise_shield/${MODEL}}"
-DATA_DIR="${RUN_ROOT}/data"
-LABELS_DIR="${RUN_ROOT}/labels/${MODEL}"
+INPUT_RUN_ROOT="${INPUT_RUN_ROOT:-../CallTool_data/when2tool_precise_shield/${MODEL}}"
+RUN_ROOT="${RUN_ROOT:-${INPUT_RUN_ROOT}}"
+DATA_DIR="${INPUT_RUN_ROOT}/data"
+LABELS_DIR="${INPUT_RUN_ROOT}/labels/${MODEL}"
 STAGE_ROOT="${RUN_ROOT}/stages/05_probing"
 ACTIVATIONS_DIR="${STAGE_ROOT}/activations"
 DISCOVERY_DIR="${STAGE_ROOT}/discovery"
@@ -49,6 +50,9 @@ done
 
 mkdir -p "${MANIFEST_DIR}" "${LOG_DIR}"
 exec > >(tee -a "${LOG_DIR}/stage5_probing.log") 2>&1
+
+echo "Stage 5 input root: ${INPUT_RUN_ROOT}"
+echo "Stage 5 output root: ${RUN_ROOT}"
 
 "${PYTHON_BIN}" -m when2tool_action.scripts.audit_provenance \
   --config "${CONFIG}" \

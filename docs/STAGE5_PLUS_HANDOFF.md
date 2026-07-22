@@ -31,7 +31,7 @@ Qwen3-4B-Instruct-2507 的 full-menu residual probe 已得到：
 | H2：存在类别选择性的因果子空间 | target 对目标 recall 的破坏超过同层同量 random，且 off-target 损伤较小 | 只有 final accuracy 普遍下降 |
 | H3：该子空间可被训练利用 | target LoRA 在同数据、同步数对照下优于 random/dense，并改善端到端指标 | 只比未训练 base 好 |
 
-第 5 阶段实际运行结果完成后应填写本文第 8 节。第 6-8 阶段在本次交接中只准备代码和冻结矩阵，不启动正式计算。
+第 5 阶段已在远程完成正式运行，结果和审计见本文第 8 节。第 6-8 阶段在本次交接中只准备代码和冻结矩阵，未启动正式计算。
 
 ## 3. 代码与大文件边界
 
@@ -54,8 +54,6 @@ Qwen3-4B-Instruct-2507 的 full-menu residual probe 已得到：
                 │   └── manifests/
                 ├── 06_causal/
                 │   ├── conditions/
-                │   ├── metrics/
-                │   ├── figures/
                 │   ├── logs/
                 │   └── manifests/
                 ├── 07_training/
@@ -65,8 +63,8 @@ Qwen3-4B-Instruct-2507 的 full-menu residual probe 已得到：
                 │   └── manifests/
                 └── 08_evaluation/
                     ├── outputs/
-                    ├── metrics/
-                    ├── figures/
+                    ├── comparison/
+                    ├── logs/
                     └── manifests/
 ```
 
@@ -110,7 +108,7 @@ T_control = TopK(saliency on balanced one-vs-rest control)
 N_class = T_class - T_control
 ```
 
-差集后保留真实数量，不补随机神经元。主设置固定为 `rho=0.003 + signed`；其余 8 组仅作 rho/sign 稳健性，不允许在 test 因果结果上择优。
+差集后保留真实数量，不补随机神经元。主设置固定为 `rho=0.003 + signed`；其余 8 组仅作 rho/activation-variant 稳健性，不允许在 test 因果结果上择优。
 
 若某个配置使 `k_l=0`，实现会直接报错，不会暗中提升为 1；本项目的 9728 维 FFN 与三档 rho 均不会触发该错误。
 
@@ -210,20 +208,22 @@ python -m pytest -q
 
 具体一键命令和单组命令以根 [README](../README.md) 为准。
 
+Stage 5 的输入与输出根已严格分离：`INPUT_RUN_ROOT` 只提供冻结 `data/labels`，`RUN_ROOT` 只决定本次 `stages/05_probing` 输出。默认两者相同以兼容正式运行；复现必须保持正式输入根、改用新的输出根，避免覆盖已有产物。
+
 ## 6. 交接验收清单
 
-- [ ] 代码仓库 worktree clean，submodule commit 正确；
-- [ ] 基础模型和 When2Tool 路径存在，runtime provenance 可验证；
-- [ ] 第 5 阶段 train/test activation 均有 manifest、shape、dtype、ID 与输入 SHA；
-- [ ] 9 组 discovery 产物目录互不覆盖，primary 固定为 `.003_signed`；
-- [ ] mask JSON 符合 `when2tool-neuron-mask-v1`，每层真实数量与 direction 可审计；
+- [x] 代码仓库提交已推送，远程 worktree clean，submodule commit 正确；
+- [x] 基础模型和 When2Tool 路径存在，Stage 5 runtime provenance 已验证；
+- [x] 第 5 阶段 train/test activation 均有 manifest、shape、dtype、ID 与输入 SHA；
+- [x] 9 组 discovery 产物目录互不覆盖，primary 固定为 `.003_signed`；
+- [x] mask JSON 符合 `when2tool-neuron-mask-v1`，每层真实数量与 direction 可审计；
 - [ ] 第 6 阶段 25 条件均完整，random 逐层同量且排除 target；
 - [ ] target 通过选择性因果门槛后才启动第 7 阶段；
 - [ ] SFT retained/dropped 分布完整，四动作均非空；
 - [ ] dense/random/target 共享相同数据、步数和超参；
 - [ ] 两种 scope 均使用冻结标签和三 generation seeds；
-- [ ] 大 tensor、逐样本 JSON、adapter、日志与图片只在数据侧；
-- [ ] 报告没有把可解码性写成因果性，也没有在 test 上选 rho/variant。
+- [x] 当前大 tensor、日志与图片只在数据侧；
+- [x] 报告没有把可解码性写成因果性，也没有在 test 上选 rho/variant。
 
 ## 7. 已知限制
 
@@ -235,15 +235,91 @@ python -m pytest -q
 
 ## 8. 第 5 阶段实际结果
 
-本节在远程探测完成后更新。没有产物前不得提前填写支持 H2/H3 的结论。
+### 8.1 运行与硬审计
 
-| 项目 | 状态/结果 |
-|---|---|
-| train MLP activation | 待运行 |
-| test MLP activation | 待运行 |
-| 9 组 neuron discovery | 待运行 |
-| primary union MLP probe | 待运行 |
-| primary layer distribution/overlap | 待运行 |
-| 是否支持 H1 | 待运行后判断 |
-| 是否支持 H2 | 必须等第 6 阶段，当前不能判断 |
-| 是否支持 H3 | 必须等第 7-8 阶段，当前不能判断 |
+正式运行日期为 2026-07-22，生成代码为 commit `3f4bf60c1b9e34665fbfcd22ea830950dac2ce4e`，Stage 5 runtime receipt SHA256 为 `0a78f15d5327f90038792213da5a7798896d0e79532ee47d6e4b44541d12ed24`。阶段目录共有 70 个文件、`2,214,392,758` bytes（约 2.06 GiB）。
+
+| split | shape | dtype | tensor bytes | tensor SHA256 | manifest SHA256 |
+|---|---|---|---:|---|---|
+| train | `[900,36,9728]` | float16 | 630,375,615 | `c35675432b2ad338a95462b80c5d3b6e37edeba601d4a18318a92170b9337db4` | `21f4b9ed592b5b357e0e6de60ce1296a7ccd14e466b598f73240d688e72fbefb` |
+| test | `[2250,36,9728]` | float16 | 1,575,937,215 | `712a6cc1f45ed68217c6e0c27e15a7fcf55a511b38408cc3ad548496e62af719` | `dfaee8ff42e258feee6fb6c2b3110a4d3ac575f6925d369caa5940b375e09bbb` |
+
+共同配置 SHA256 为 `0cb3ad38b4ef42b6431a5f41fac8d90d8f8655ca1aa4019313599c4a89a37d8c`，模型配置 SHA256 为 `5beea1a4a34c62782bfb2f911c606741a3bab8f92d80a118fa053c28af12e8ba`，`down_proj` column norms SHA256 为 `27e1fbcc4960c700ef7855ada7130e2640d4de2b732510a313aa7a6c37ed7d46`。train/test 中每条样本的 menu SHA 都等于冻结 full-menu SHA `9fe32b5541d03e6948982b1669fb0d289325f0124ef204d159c239487766f117`。
+
+9/9 discovery 目录完整，每组恰有 mask JSON、neuron CSV、probe JSON、probe model 和 3 张 PNG。独立硬审计已经通过：
+
+- 9 个 mask 的 canonical JSON SHA 与各自 probe receipt 完全一致；
+- 9 组共享同一 selection hashes、evaluation hashes、control sample receipt、生成 commit 和 runtime receipt；
+- `selection_split=train` 且 `test_used_for_selection=false`；
+- activation tensor、down-norm、ID、task、label、config、mask union SHA 均与 manifest 一致；
+- primary 仍是预注册的 `.003_signed`，没有依据 test 指标改选。
+
+Primary 的 one-vs-rest control seed 为 42。实际每侧样本数及 difficulty 分布如下；target 与 control 两侧的分布逐项相同。
+
+| class | target pool / rest pool | actual each side | easy / medium / hard |
+|---|---:|---:|---|
+| NONE | 498 / 402 | 246 | 77 / 97 / 72 |
+| A | 125 / 775 | 125 | 6 / 35 / 84 |
+| B | 193 / 707 | 193 | 46 / 47 / 100 |
+| C | 84 / 816 | 84 | 25 / 15 / 44 |
+
+### 8.2 九组探针结果
+
+下表两个指标列都按 `Accuracy / Balanced Accuracy / Macro-F1 / AUROC` 排列；类别数量按 `NONE/A/B/C` 排列。9 组是预先定义的设计条件，不是随机重复，不能对其求 mean±std。
+
+| rho | variant | unique / assignments | NONE/A/B/C | binary 四指标 | 四动作四指标 |
+|---:|---|---:|---|---|---|
+| .001 | signed | 103 / 119 | 17/35/36/31 | .6422/.6231/.5771/.8451 | .5267/.2500/.1725/.9056 |
+| .001 | positive | 125 / 154 | 28/43/47/36 | .6067/.5846/.5091/.8627 | .5267/.2500/.1725/.9132 |
+| .001 | abs | 101 / 117 | 17/34/35/31 | .6404/.6212/.5746/.8455 | .5267/.2500/.1725/.9056 |
+| **.003** | **signed（primary）** | **306 / 375** | **58/110/109/98** | **.8018/.7923/.7917/.8827** | **.6031/.3365/.3101/.9349** |
+| .003 | positive | 312 / 371 | 58/108/115/90 | .7920/.7831/.7826/.8887 | .6378/.3759/.3531/.9370 |
+| .003 | abs | 306 / 370 | 57/109/106/98 | .8013/.7918/.7911/.8844 | .6076/.3415/.3161/.9361 |
+| .005 | signed | 512 / 608 | 99/182/186/141 | .8200/.8121/.8131/.9016 | .7244/.4906/.4901/.9452 |
+| .005 | positive | 482 / 580 | 97/176/167/140 | .7933/.7828/.7808/.8965 | .6960/.4426/.4137/.9442 |
+| .005 | abs | 497 / 590 | 95/178/181/136 | .8213/.8134/.8145/.9019 | .7187/.4836/.4843/.9448 |
+
+四动作 majority classifier 的 Accuracy/Balanced Accuracy/Macro-F1 为 `.5267/.25/.1725`。Primary 的四动作 Accuracy、Balanced Accuracy 和 Macro-F1 分别只高 `.0764/.0865/.1376`；OVR-AUROC `.9349` 则说明 one-vs-rest 排序信号较强。两者背离意味着不能仅凭 AUROC 宣称路由分类可靠。
+
+与既有 full residual probe 相比，primary sparse FFN 的四动作 Accuracy/Balanced Accuracy/Macro-F1/AUROC 分别低 `.2538/.4475/.4984/.0284`。因此不能写成“306 个神经元保留了大部分动作能力”或“已经找到主要决策位置”。
+
+### 8.3 Primary 神经元结构
+
+每类每层先取 29 个候选，再做 target-control set difference；`survival` 是最终数量除以 `36×29`，不是预设保留率。early/middle/late 固定定义为层 `0-11/12-23/24-35`；normalized entropy 为 `-Σ p_l log(p_l) / log(36)`。
+
+| class | neurons | survival | direction `- / +` | early / middle / late | 数量最高的层 |
+|---|---:|---:|---:|---|---|
+| NONE | 58 | 5.56% | 24 / 34 | 12.1% / 41.4% / 46.6% | 21-25（各 4） |
+| A | 110 | 10.54% | 53 / 57 | 8.2% / 44.5% / 47.3% | 23（9），21/22（各 8） |
+| B | 109 | 10.44% | 48 / 61 | 11.0% / 39.4% / 49.5% | 25（8），23（7），20/21/22（各 6） |
+| C | 98 | 9.39% | 47 / 51 | 11.2% / 38.8% / 50.0% | 20/25（各 9），22/24/28（各 7） |
+
+全部 375 个 class assignments 合并后，early/middle/late 占比约为 `10.4%/41.1%/48.5%`。各类 normalized layer entropy 为 `.892-.917`，所以正确表述是“后半层偏重、但仍跨层分布”，不是“集中在少数层”。
+
+306 个 unique features 中，241 个只属于一个动作、61 个属于两个动作、4 个属于三个动作，没有同时属于四动作的 feature。类别间 Jaccard：
+
+|  | NONE | A | B | C |
+|---|---:|---:|---:|---:|
+| NONE | 1 | .0839 | .0570 | .0833 |
+| A | .0839 | 1 | .0631 | .1123 |
+| B | .0570 | .0631 | 1 | .0248 |
+| C | .0833 | .1123 | .0248 | 1 |
+
+这些集合大体区分但并非互斥；低重叠只能提供候选类别选择性，不能代替消融验证。
+
+### 8.4 稳健性与假设判断
+
+- `.001` 的四动作 hard decision 在三种 variant 下都退化到 majority，说明极稀疏定位不稳健。
+- `.003` 的四动作 Balanced Accuracy 仅 `.336-.376`；primary 不是同组 test 指标最高的配置，但仍必须保持预注册选择。
+- `.005` 的四动作 Balanced Accuracy/Macro-F1 提升到 `.443-.491`；存在明确 feature-budget/rho 依赖，改善不能全部解释为更精准定位。
+- Primary 与 `.003_abs` 的 union Jaccard 为 `.9245`，是同 rho 的正向稳定性；与 `.003_positive` 仅 `.0369`，说明对 activation transform 敏感。
+- signed 的 primary 与 `.001_signed/.005_signed` union Jaccard 仅 `.0124/.0863`，说明具体 neuron 身份对 rho 高度不稳定。
+- 当前没有同维度 random-neuron decoding probe、置信区间或显著性检验，因此不能声称这 306 个 neurons 是唯一、充分、必要或统计显著优于随机的子集。
+
+| 假设 | 当前判断 | 理由 |
+|---|---|---|
+| H1 | **有限但明确支持** | binary 证据较强；四动作 test hard metrics 有限超过 prior，OVR 排序信号较强，但明显弱于 residual 且依赖 feature budget |
+| H2 | **尚不能判断；值得按冻结 primary 进入 Stage 6** | 需要 target 相对同层同量 random 的目标 recall drop、off-target、INVALID/parse、FinalAcc 联合证据 |
+| H3 | **尚不能判断** | Stage 7-8 未运行，不能从 probe 结果推断 masked-LoRA 的训练收益 |
+
+Stage 6 的关键区分是：target mask 是否选择性改变动作类别，还是只破坏晚层工具格式/通用生成。若目标 recall 下降同时伴随所有类别、parse/schema、FinalAcc 普遍恶化，只能支持“高影响输出神经元”，不能支持“类别专属路由”。无论 Stage 6 阳性或阴性都应保留：阳性支持局部因果贡献；阴性则与强 residual probe 一起指向分布式或冗余表征。

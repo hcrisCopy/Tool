@@ -9,12 +9,14 @@
 | 阶段 | 状态 | 本次交付 |
 |---|---|---|
 | 数据、标签、residual probe | 已完成必要前置 | full train/test、冻结标签、binary/四动作 probe |
-| 05 FFN 探测 | 代码已完成；本仓库阶段报告记录实跑状态 | train-only 选神经元、9 组 mask、MLP probes、图表 |
+| 05 FFN 探测 | 远程正式实跑完成（2026-07-22；生成提交 `3f4bf60`） | train-only 选神经元、9 组 mask、MLP probes、图表 |
 | 06 因果验证 | 代码与 25 条件矩阵已完成，未正式运行 | no-mask / 4 target / 20 random，原子 checkpoint |
 | 07 轨迹与训练 | 代码与固定对照已完成，未正式运行 | target / dense / 3 random masked-LoRA |
 | 08 训练后评测 | 代码与 12 格汇总已完成，未正式运行 | 2 scopes × 6 conditions × 3 generation seeds |
 
 已有 residual 特征在 full test 上的结果：binary Accuracy/AUROC 为 `0.8542/0.9239`；四动作 Accuracy/Balanced Accuracy/Macro-F1/OVR-AUROC 为 `0.8569/0.7840/0.8085/0.9633`，多数类基线为 `0.5267`。这只证明可解码，不等于 FFN 因果性。研究主张与最新直接相关工作见[研究定位](docs/RESEARCH_POSITIONING.md)。
+
+第 5 阶段预注册主设置 `.003_signed` 在 held-out test 上得到：binary Accuracy/Balanced Accuracy/Macro-F1/AUROC 为 `0.8018/0.7923/0.7917/0.8827`；四动作对应为 `0.6031/0.3365/0.3101/0.9349`。四动作 hard-decision 指标仅有限超过 majority/prior（Accuracy `0.5267`、Balanced Accuracy `0.25`、Macro-F1 `0.1725`），因此 H1 只获得“有限但明确”的支持；H2/H3 尚未运行，不能判断。
 
 ## 目录与大文件边界
 
@@ -95,24 +97,35 @@ python -m pytest -q
 
 ## 第 5 阶段：FFN 探测
 
-### 正式一键运行
+### 复现（使用新的 `RUN_ROOT`）
 
-建议在持久终端会话中运行：
+当前正式产物目录为不可覆盖设计；复现时应在持久终端会话中显式指定一个新的输出 `RUN_ROOT`，不要对已有正式目录直接重跑。脚本从 `INPUT_RUN_ROOT` 读取既有 `data/` 与 `labels/`；其默认值是正式 run root，因此下面只改输出根即可：
 
 ```bash
-bash scripts/run_stage5_probing.sh
+RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica \
+  bash scripts/run_stage5_probing.sh
 ```
 
-若 train/test activation 已完整生成、只需运行 9 组 CPU 探测：
+如果接手方把输入快照放到了另一个相对目录，必须显式同时设置两者；脚本不会复制、下载或猜测输入：
 
 ```bash
-STAGE_START=discovery bash scripts/run_stage5_probing.sh
+INPUT_RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507 \
+RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica \
+  bash scripts/run_stage5_probing.sh
+```
+
+若同一个 replica `RUN_ROOT` 下的 train/test activation 已完整生成、只需运行 9 组 CPU 探测：
+
+```bash
+RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica \
+  STAGE_START=discovery bash scripts/run_stage5_probing.sh
 ```
 
 默认 batch size 为 1；确认显存余量后可显式改成 2，但不同 batch size 会写入 manifest：
 
 ```bash
-EXTRACTION_BATCH_SIZE=2 bash scripts/run_stage5_probing.sh
+RUN_ROOT=../CallTool_data/when2tool_precise_shield/qwen3-4b-instruct-2507-replica \
+  EXTRACTION_BATCH_SIZE=2 bash scripts/run_stage5_probing.sh
 ```
 
 抽取严格使用 full menu、`current + no_reasoning`、最后一个有效输入 token，以及每层 `SiLU(gate_proj(x)) * up_proj(x)`；保存 shape 为 train `[900,36,9728]`、test `[2250,36,9728]` 的 float16 tensor。神经元选择只读取 train，所有 9 个 mask 冻结后才打开 test 数据。
@@ -128,6 +141,31 @@ EXTRACTION_BATCH_SIZE=2 bash scripts/run_stage5_probing.sh
 | top-k | 每层 `floor(rho × 9728)`，随后 target-control set difference，不补位 |
 | primary | `rho=0.003 + signed`，其余仅作稳健性 |
 | probe | StandardScaler + L2 logistic，`C=0.0001`，train fit / test only evaluation |
+
+### 已完成的正式结果
+
+本次正式运行由 commit `3f4bf60c1b9e34665fbfcd22ea830950dac2ce4e` 生成；阶段 runtime receipt SHA256 为 `0a78f15d5327f90038792213da5a7798896d0e79532ee47d6e4b44541d12ed24`。Stage 5 共 70 个文件、`2,214,392,758` bytes（约 2.06 GiB）；9/9 discovery 目录完整，每组固定 7 个文件。硬审计已验证 activation tensor SHA、9 个 canonical mask SHA、共享 selection/evaluation/control receipt、生成 commit，以及 `selection_split=train`、`test_used_for_selection=false`。
+
+| split | shape / dtype | tensor bytes | tensor SHA256 | manifest SHA256 |
+|---|---|---:|---|---|
+| train | `[900,36,9728]` / float16 | 630,375,615 | `c35675432b2ad338a95462b80c5d3b6e37edeba601d4a18318a92170b9337db4` | `21f4b9ed592b5b357e0e6de60ce1296a7ccd14e466b598f73240d688e72fbefb` |
+| test | `[2250,36,9728]` / float16 | 1,575,937,215 | `712a6cc1f45ed68217c6e0c27e15a7fcf55a511b38408cc3ad548496e62af719` | `dfaee8ff42e258feee6fb6c2b3110a4d3ac575f6925d369caa5940b375e09bbb` |
+
+下表指标顺序均为 `Accuracy / Balanced Accuracy / Macro-F1 / AUROC`；类别数量顺序为 `NONE/A/B/C`。9 组是设计条件，不是随机重复，不能求 mean±std，也不能按 test 结果改选 primary。
+
+| rho | variant | unique / assignments | NONE/A/B/C | binary 四指标 | 四动作四指标 |
+|---:|---|---:|---|---|---|
+| .001 | signed | 103 / 119 | 17/35/36/31 | .6422/.6231/.5771/.8451 | .5267/.2500/.1725/.9056 |
+| .001 | positive | 125 / 154 | 28/43/47/36 | .6067/.5846/.5091/.8627 | .5267/.2500/.1725/.9132 |
+| .001 | abs | 101 / 117 | 17/34/35/31 | .6404/.6212/.5746/.8455 | .5267/.2500/.1725/.9056 |
+| **.003** | **signed（primary）** | **306 / 375** | **58/110/109/98** | **.8018/.7923/.7917/.8827** | **.6031/.3365/.3101/.9349** |
+| .003 | positive | 312 / 371 | 58/108/115/90 | .7920/.7831/.7826/.8887 | .6378/.3759/.3531/.9370 |
+| .003 | abs | 306 / 370 | 57/109/106/98 | .8013/.7918/.7911/.8844 | .6076/.3415/.3161/.9361 |
+| .005 | signed | 512 / 608 | 99/182/186/141 | .8200/.8121/.8131/.9016 | .7244/.4906/.4901/.9452 |
+| .005 | positive | 482 / 580 | 97/176/167/140 | .7933/.7828/.7808/.8965 | .6960/.4426/.4137/.9442 |
+| .005 | abs | 497 / 590 | 95/178/181/136 | .8213/.8134/.8145/.9019 | .7187/.4836/.4843/.9448 |
+
+Primary 的 306 个 unique features 对应 375 个类别 assignments；241 个只属于一类、61 个属于两类、4 个属于三类。类别间 Jaccard 为 `0.0248-0.1123`，集合大体区分但不互斥；按 assignments 汇总的 early/middle/late（层 0-11/12-23/24-35）占比约为 `10.4%/41.1%/48.5%`，应表述为“后半层偏重、仍跨层分布”。`.003_signed` 与同 rho 的 abs union Jaccard 为 `0.9245`，但与 positive 仅 `0.0369`；signed 跨 rho 仅 `0.0124/0.0863`。具体 neuron 身份和四分类能力明显依赖变体与 feature budget，详细结果、关键 SHA 和结论边界见[阶段交接](docs/STAGE5_PLUS_HANDOFF.md)与[数据清单](docs/data_manifest.md)。
 
 关键输出：
 
@@ -153,7 +191,7 @@ stages/05_probing/
 bash scripts/run_stage6_causal.sh
 ```
 
-这会在相同 HF backend 下运行 25 个条件：1 个 no-mask、4 个 target mask、每类 5 个 random mask；random seeds 为 `0-4`，generation seed 默认为 `0`。若资源允许，再补三个 generation seeds：
+这会在相同 HF backend 下运行 25 个条件：1 个 no-mask、4 个 target mask、每类 5 个 random mask；random seeds 为 `0-4`，generation seed 默认为 `0`。若资源允许，再补齐到三个 generation seeds：
 
 ```bash
 CAUSAL_GENERATION_SEEDS="0 1 2" bash scripts/run_stage6_causal.sh
@@ -243,10 +281,10 @@ STAGE_START=summary bash scripts/run_stage8_evaluation.sh
 
 | 阶段 | 必须看到 | 结论边界 |
 |---|---|---|
-| 05 | 两个 activation manifest、9 个完整 discovery 目录、primary probe metrics | 只能判断 H1 可解码性 |
+| 05 | **已验收**：两个 activation manifest、9 个完整 discovery 目录、canonical mask/probe/hash 合同全部通过 | H1 获有限但明确支持；仍不能推出因果性 |
 | 06 | `panel_status=complete`、25 条件全齐、target/random 选择性比较 | 才能判断 H2 因果性 |
 | 07 | SFT retained/dropped 审计、5 个 `train_manifest.json`、非选中行断言 | 只能说明训练正确执行 |
-| 08 | 12 格 × 3 seeds、`comparison_summary.json` 和两张图 | 才能判断 H3 与 Pareto |
+| 08 | 12 格 × 3 seeds、`comparison_summary.json` 和两张图 | 只能在统一 HF backend 内描述性评估 H3/Pareto；不能据此宣称优于 vLLM Probe&Prefill |
 
 每个阶段都有独立 `runtime_provenance.json`。旧统计 receipt 不覆盖；若仓库在生成报告后前进，恢复旧 checkpoint 时应检出产物记录的生成 commit。
 
