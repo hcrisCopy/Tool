@@ -80,7 +80,15 @@ def initial_messages_and_tools(
     utils, _, _ = load_runtime()
     built = build_environments(task, setting.tool_scope)
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    if task["gold_env_name"] == "ListManipulationEnv":
+    # The ListManipulation contract is a property of the exposed tool menu, not
+    # of the hidden gold environment.  In full-menu runs those tools are
+    # available for every task, so every task must receive the same contract;
+    # conditioning this message on gold_env_name would leak the target.
+    exposes_list_tools = (
+        setting.tool_scope == "full"
+        or task["gold_env_name"] == "ListManipulationEnv"
+    )
+    if exposes_list_tools:
         messages.append(
             {
                 "role": "system",

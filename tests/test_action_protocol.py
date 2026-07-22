@@ -12,7 +12,11 @@ from when2tool_action.constants import (
     EXPECTED_TOOL_COUNT,
 )
 from when2tool_action.labels import build_label_rows
-from when2tool_action.runtime import attach_gold_actions
+from when2tool_action.runtime import (
+    EvaluationSetting,
+    attach_gold_actions,
+    initial_messages_and_tools,
+)
 from when2tool_action.safety import (
     normalize_code,
     trusted_code_from_tasks,
@@ -74,6 +78,41 @@ def test_full_builder_keeps_gold_task_metadata_and_menu_order() -> None:
     assert first.route_map["evaluate_expression"].category == "A"
     assert first.route_map["search_corpus"].category == "B"
     assert first.route_map["run_code"].category == "C"
+
+
+def test_full_prompt_contract_does_not_depend_on_gold_environment() -> None:
+    setting = EvaluationSetting(
+        name="current_no_reasoning_fulltools",
+        tool_scope="full",
+        prompt_mode="current",
+        require_reasoning=False,
+        record_mode="lite",
+    )
+    for env in ("CalculatorEnv", "CodeExecutorEnv"):
+        messages, built = initial_messages_and_tools(
+            _task(env=env), system_prompt="SYSTEM", setting=setting
+        )
+        assert len(messages) == 3
+        assert messages[0] == {"role": "system", "content": "SYSTEM"}
+        assert messages[1]["role"] == "system"
+        assert messages[1]["content"].startswith(
+            "ListManipulation format contract:"
+        )
+        assert len(built.schemas) == EXPECTED_TOOL_COUNT
+
+
+def test_scoped_prompt_only_adds_contract_when_list_tools_are_exposed() -> None:
+    setting = EvaluationSetting(
+        name="current_no_reasoning_scoped",
+        tool_scope="scoped",
+        prompt_mode="current",
+        require_reasoning=False,
+        record_mode="lite",
+    )
+    messages, _ = initial_messages_and_tools(
+        _task(env="CalculatorEnv"), system_prompt="SYSTEM", setting=setting
+    )
+    assert len(messages) == 2
 
 
 def test_hard_no_tool_labels_and_gold_attachment() -> None:
